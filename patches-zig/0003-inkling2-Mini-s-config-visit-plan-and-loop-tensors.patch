@@ -1,7 +1,7 @@
 From 6aa4813ce74551a8128ff35998166bff5678389a Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 07:42:35 +1100
-Subject: [PATCH 03/24] inkling2: Mini's config, visit plan and loop tensors
+Subject: [PATCH 03/29] inkling2: Mini's config, visit plan and loop tensors
 
 config.zig accepts inkling2_loop with its loop_config (fixed passes only,
 a core that opens a residual block, gate rank 64) and checks drafter taps

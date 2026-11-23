@@ -1,7 +1,7 @@
 From 053d2bdc5b275f5b316440321f31e71d15367605 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 13:20:11 +1100
-Subject: [PATCH 05/24] inkling2: run Mini's loop in the forward
+Subject: [PATCH 05/29] inkling2: run Mini's loop in the forward
 
 The forward walks the visit plan instead of the layers: 48 visits for
 Mini, each with its own cache slot (KV rings and conv states), passes 2

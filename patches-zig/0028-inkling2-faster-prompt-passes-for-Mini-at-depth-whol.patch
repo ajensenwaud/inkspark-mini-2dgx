@@ -1,0 +1,353 @@
+From e9daad686c4ab6bf9c8225862b6fab1f4dc870a5 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:31:21 +1100
+Subject: [PATCH 28/29] inkling2: faster prompt passes for Mini at depth: whole
+ 2,048-row calls and fp8 keys widened once a call
+
+Mini's prompt chunks split into calls of 1,024 / 512 / 256 rows past 128K, 256K and 512K because the shared
+partials held 8 global chunks a row; they now hold every chunk of the context (0.8 GB a rank at 1M), so each
+2,048-row chunk is one call at any depth (Small unchanged). On fp8 caches each global visit's prompt call first
+widens the slot's keys to bf16 in the bf16 prompt kernel's layout (tf_ink2_kv_widen, tf_ink2_attn_prompt8's
+tile values), then runs tf_ink2_attn_prompt: the same tile values into the same mma sequence, at the bf16 kernel's
+speed. tf-inkling2-engine ptiming times one chunk at given depths and hashes chunk logits for A/B checks.
+---
+ zig/kernels/cuda/inkling2/prompt_attention.cu | 17 +++++
+ zig/src/families/inkling2/engine.zig          |  7 +-
+ zig/src/families/inkling2/engine_main.zig     |  8 ++-
+ zig/src/families/inkling2/engine_prefill.zig  | 68 +++++++++++++++++++
+ zig/src/families/inkling2/forward.zig         | 17 ++++-
+ zig/src/families/inkling2/kernels.zig         | 33 +++++++--
+ zig/src/families/inkling2/kernels_test.zig    |  2 +-
+ 7 files changed, 139 insertions(+), 13 deletions(-)
+ create mode 100644 zig/src/families/inkling2/engine_prefill.zig
+
+diff --git a/zig/kernels/cuda/inkling2/prompt_attention.cu b/zig/kernels/cuda/inkling2/prompt_attention.cu
+index da1fc3b7f..7d161e85e 100644
+--- a/zig/kernels/cuda/inkling2/prompt_attention.cu
++++ b/zig/kernels/cuda/inkling2/prompt_attention.cu
+@@ -336,3 +336,20 @@ extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1)
+     ink2p::promptTile<true>(q, kc, vc, tab, segs, part_o, part_ml, heads, kv_heads, ring, chunk, c0, chunks, scale,
+                             ksc, vsc, smem);
+ }
++
++// One slot's fp8 keys 0..last as bf16 [kv_head][ring][128] (tf_ink2_attn_prompt8's tile values): attn_prompt's input.
++extern "C" __global__ void __launch_bounds__(512) tf_ink2_kv_widen(const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
++                                                                  const float* __restrict__ ksc, const float* __restrict__ vsc,
++                                                                  long long off, int kv_heads, int ring, int last, uint16_t* __restrict__ ko,
++                                                                  uint16_t* __restrict__ vo) {
++    const int key = static_cast<int>(blockIdx.x) * 64 + (threadIdx.x >> 3), piece = threadIdx.x & 7;
++    if (key > last) return;
++    const bool v = blockIdx.z != 0;
++    const size_t row = static_cast<size_t>(key) * kv_heads + blockIdx.y;  // a global ring holds every key: no wrap
++    const uint4 w = *reinterpret_cast<const uint4*>((v ? vc : kc) + off + row * ink2p::kDim + piece * 16);
++    const float sc = (v ? vsc : ksc)[off / ink2p::kDim + row];
++    const uint2 a = ink2p::deq4(w.x, sc), b = ink2p::deq4(w.y, sc), c = ink2p::deq4(w.z, sc), d = ink2p::deq4(w.w, sc);
++    uint16_t* o = (v ? vo : ko) + (static_cast<size_t>(blockIdx.y) * ring + key) * ink2p::kDim + piece * 16;
++    *reinterpret_cast<uint4*>(o) = make_uint4(a.x, a.y, b.x, b.y);
++    *reinterpret_cast<uint4*>(o + 8) = make_uint4(c.x, c.y, d.x, d.y);
++}
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 3b388ed63..5a8cc56b4 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -102,10 +102,13 @@ pub const Engine = struct {
+         const heads = e.w.share.heads.len();
+         const kv = e.w.share.kv.len();
+         const kv8 = try fw.kvSetting();
+-        e.shape_p = .{ .rows = prompt_rows, .context = o.capacity, .heads = heads, .kv = kv, .kv8 = kv8 };
++        // Mini's fp8 prompt rows read global keys widened to bf16 once a call (the same tile values, the faster kernel)
++        e.shape_p = .{ .rows = prompt_rows, .context = o.capacity, .heads = heads, .kv = kv, .kv8 = kv8, .widen = e.c.loop != null };
+         e.shape_d = .{ .rows = shared_rows, .context = o.capacity, .heads = heads, .kv = kv, .ring_rows = prompt_rows, .hist = true, .kv8 = kv8 };
+         errdefer for (e.parts.items) |*b| b.free();
+-        const slots = @max(prompt_rows * heads * prompt_parts, shared_rows * heads * fw.stride(&e.c, o.capacity - 1));
++        // Mini's prompt calls keep all their rows at any depth (partials for every global chunk); Small's split
++        const parts: usize = if (e.c.loop != null) @max(prompt_parts, fw.stride(&e.c, o.capacity - 1)) else prompt_parts;
++        const slots = @max(prompt_rows * heads * parts, shared_rows * heads * fw.stride(&e.c, o.capacity - 1));
+         const shared = try fw.partialsFor(d, &e.parts, gpa, slots);
+         e.bp = try fw.Buffers.init(gpa, d, &e.w, e.shape_p, shared);
+         errdefer e.bp.deinit();
+diff --git a/zig/src/families/inkling2/engine_main.zig b/zig/src/families/inkling2/engine_main.zig
+index 790ac04fa..4c420e58f 100644
+--- a/zig/src/families/inkling2/engine_main.zig
++++ b/zig/src/families/inkling2/engine_main.zig
+@@ -3,13 +3,14 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const ink = @import("inkling2");
+ 
+-const usage = "usage: tf-inkling2-engine graphs|greedy|drafted|multi|drafts|images|timing <model dir> <ids.json> <out dir> [context] [new]\n" ++
++const usage = "usage: tf-inkling2-engine graphs|greedy|drafted|multi|drafts|images|timing|ptiming <model dir> <ids.json> <out dir> [context] [new]\n" ++
+     "  graphs: decode windows eager in some slots and graphed in others on the same rows; logits must match bit for bit\n" ++
+     "  greedy: each text's prompt pass then greedy decode rows, eager (writes greedy.json: name -> tokens)\n" ++
+     "  multi: drafted == plain at 1/2/4/8 streams (eager, graphed, oracle, sampled); Mini's batched == per-stream drafts\n" ++
+     "  drafts: the drafter at ~12 anchors a text after a prompt pass to each (drafts.json, drafts-r<rank>.bin)\n" ++
+     "  images: <ids.json> is a directory of NAME.png + NAME.ids.u32; spliced rows, solo/drafted/concurrent greedy\n" ++
+     "  timing: graphed windows by rows and streams, draft passes, a short keep (median ms of 16 after 3 warm)\n" ++
++    "  ptiming: one prompt chunk at each depth of [new] (comma list), median ms of 3 after a warm one\n" ++
+     "  two ranks: TF_INKLING2_RANK, TF_INKLING2_WORLD and NCCL_COMM_ID on both\n";
+ 
+ const Text = struct { name: []const u8, ids: []u32 };
+@@ -39,7 +40,7 @@ pub fn main(init: std.process.Init) !u8 {
+         try list.append(a, .{ .name = e.key_ptr.*, .ids = ids });
+     }
+     const context = if (args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 32768;
+-    const new = if (args.len > 6) try std.fmt.parseInt(usize, args[6], 10) else 64;
++    const new = if (args.len > 6) std.fmt.parseInt(usize, args[6], 10) catch 64 else 64; // ptiming: depths there
+ 
+     var driver = try cuda.Driver.open();
+     defer driver.close();
+@@ -56,7 +57,7 @@ pub fn main(init: std.process.Init) !u8 {
+         try group.?.openRoce(gpa, io, &driver, e.stream, e.roceBytes());
+         e.exchange = .{ .nccl = .{ .lib = &group.?.lib, .comm = group.?.comm, .group = &group.? } };
+     }
+-    try e.reserve(16);
++    try e.reserve(if (std.mem.eql(u8, args[1], "ptiming")) 1 else 16); // ptiming: one slot at a long context
+     try std.Io.Dir.cwd().createDirPath(io, args[4]);
+     var out = try std.Io.Dir.cwd().openDir(io, args[4], .{});
+     defer out.close(io);
+@@ -64,6 +65,7 @@ pub fn main(init: std.process.Init) !u8 {
+     if (std.mem.eql(u8, args[1], "drafts")) return drafts(e, a, io, out, list.items, place.rank);
+     if (pics) return @import("engine_images.zig").run(e, a, io, args[3], out, new, r0);
+     if (std.mem.eql(u8, args[1], "timing")) return @import("engine_timing.zig").run(e, a, io, list.items, r0);
++    if (std.mem.eql(u8, args[1], "ptiming")) return @import("engine_prefill.zig").run(e, a, io, list.items, if (args.len > 6) args[6] else "8192", 3, r0);
+     if (std.mem.eql(u8, args[1], "multi")) return @import("engine_multi.zig").run(e, a, list.items, new, r0);
+     if (std.mem.eql(u8, args[1], "drafted")) {
+         var bad: usize = 0;
+diff --git a/zig/src/families/inkling2/engine_prefill.zig b/zig/src/families/inkling2/engine_prefill.zig
+new file mode 100644
+index 000000000..bd4bc5ad0
+--- /dev/null
++++ b/zig/src/families/inkling2/engine_prefill.zig
+@@ -0,0 +1,68 @@
++//! tf-inkling2-engine ptiming: one prompt chunk timed at each depth, the slot standing there on zeroed caches.
++const std = @import("std");
++const ink = @import("inkling2");
++
++const Engine = ink.engine.Engine;
++
++/// Each depth (a multiple of prompt_rows): a warm chunk, then `reps` timed; rank 0 prints the median.
++pub fn run(e: *Engine, a: std.mem.Allocator, io: std.Io, texts: anytype, spec: []const u8, reps: usize, r0: bool) !u8 {
++    if (texts.len == 0) return error.NoTexts;
++    const rows = ink.engine.prompt_rows;
++    const src = texts[0].ids;
++    var it = std.mem.tokenizeAny(u8, spec, ",_\\");
++    while (it.next()) |word| {
++        const depth = try std.fmt.parseInt(usize, word, 10);
++        if (depth % rows != 0) return error.DepthNotChunked;
++        const ids = try a.alloc(u32, depth + rows + 1); // one id past the chunk: no draw, the head on the last row
++        for (ids, 0..) |*x, i| x.* = src[i % src.len];
++        const ms = try a.alloc(f64, reps);
++        for (0..reps + 1) |rep| {
++            try e.bind(0);
++            e.begin(null);
++            e.st.?.pos[0] = depth;
++            try e.stream.synchronize();
++            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++            if (try e.prefillChunk(ids, depth) != null) return error.ChunkEnded;
++            try e.stream.synchronize();
++            const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
++            if (rep > 0) ms[rep - 1] = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
++        }
++        const nv = e.w.share.vocab.len();
++        const row = try a.alloc(u8, nv * 4);
++        try e.bp.logits.download(lastRow(e, depth) * nv * 4, row); // the last call's last row (the call split by depth)
++        std.debug.print("rank {d} depth {d}: last-row logits hash {x:0>16}\n", .{ e.w.share.rank, depth, std.hash.Wyhash.hash(0, row) });
++        std.mem.sort(f64, ms, {}, std.sort.asc(f64));
++        if (r0) std.debug.print("prompt chunk of {d} rows at depth {d}: {d:.1} ms median of {d} ({d:.0} tok/s), min {d:.1}\n", .{ rows, depth, ms[reps / 2], reps, @as(f64, rows) * 1e3 / ms[reps / 2], ms[0] });
++    }
++    return real(e, a, src, r0);
++}
++
++/// The row index of a chunk's last row in its last call (prefillChunk's split of a deep chunk).
++fn lastRow(e: *Engine, depth: usize) usize {
++    const rows = ink.engine.prompt_rows;
++    const most = @max(1, e.bp.parts.slots / (e.shape_p.heads * ink.forward.stride(&e.c, depth + rows - 1)));
++    const n = @min(rows, most);
++    return (rows - 1) % n;
++}
++
++/// A real prompt of 5 chunks and 777 rows from position 0: each chunk's last-row logits hashed (arms compare bits).
++fn real(e: *Engine, a: std.mem.Allocator, src: []const u32, r0: bool) !u8 {
++    const rows = ink.engine.prompt_rows;
++    const ids = try a.alloc(u32, 5 * rows + 777);
++    for (ids, 0..) |*x, i| x.* = src[(i * 7 + i / src.len) % src.len]; // tiled, shifted each pass: no exact repeats
++    const nv = e.w.share.vocab.len();
++    const row = try a.alloc(u8, nv * 4);
++    try e.bind(0);
++    e.begin(null);
++    var at: usize = 0;
++    while (at < ids.len) : (at += rows) {
++        const t = try e.prefillChunk(ids, at);
++        try e.stream.synchronize();
++        const last = @min(ids.len - at, rows) - 1;
++        try e.bp.logits.download(last * nv * 4, row);
++        const h = std.hash.Wyhash.hash(0, row);
++        std.debug.print("rank {d} chunk at {d}: last-row logits hash {x:0>16}{s}\n", .{ e.w.share.rank, at, h, if (t != null) " (prompt end)" else "" });
++    }
++    _ = r0;
++    return 0;
++}
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 0d1247ecf..eeb405572 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -87,6 +87,7 @@ pub const Shape = struct {
+     ring_rows: usize = 0, // rows a call may write into a sliding ring (0: rows)
+     hist: bool = false, // the calls keep each row's conv inputs (Buffers.hist), so a short keep needs no forward
+     kv8: bool = false, // global layers' caches in fp8 (TF_INKLING2_KV=fp8, kvSetting)
++    widen: bool = false, // fp8 prompt rows read their global keys widened to bf16 (Buffers.wide)
+ 
+     pub fn sliding(s: Shape, c: *const cfg.Config) kernels.Layer {
+         return kernels.Layer.sliding(c.window, @intCast(if (s.ring_rows > 0) s.ring_rows else s.rows));
+@@ -170,6 +171,8 @@ pub const Buffers = struct {
+     taps: u64 = 0, // bf16 [rows][taps n][hidden]: the drafter's taps of these rows (the engine's, with a drafter)
+     hist: u64 = 0, // fp32 conv inputs of these rows, histAt's layout (Shape.hist; else 0)
+     lp: loop.Scratch = .{}, // Mini's loop: the banks, mixes and gates of these rows (rows 0 without a loop)
++    wide: u64 = 0, // Shape.widen: bf16 K then V of one slot's global keys, `wide_half` bytes each
++    wide_half: u64 = 0,
+ 
+     /// Scratch for `s.rows` rows; `shared` partials, else its own for every row at the shape's context.
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, s: Shape, shared: ?Partials) !Buffers {
+@@ -218,6 +221,10 @@ pub const Buffers = struct {
+         b.exs = try cuda.exl3_experts.scratch(try A(&b, d, try experts.scratchBytes(el, @min(n, expert_rows), c.topk)), el, @min(n, expert_rows), c.topk);
+         b.logits = try Buf.alloc(d, n * w.share.vocab.len() * 4);
+         if (s.hist) b.hist = try A(&b, d, histAt(c, s.kv, n, c.visits(), 0));
++        if (s.widen and s.kv8) {
++            b.wide_half = @as(u64, s.global().ring) * s.kv * hd * 2;
++            b.wide = try A(&b, d, 2 * b.wide_half);
++        }
+         if (c.loop != null) {
+             const Ctx = struct {
+                 b: *Buffers,
+@@ -270,7 +277,7 @@ fn stageBytes(n: usize, ni: usize, nt: usize) usize {
+ pub const Images = struct { rows: u64, spans: []const vision.Span, lo: usize };
+ 
+ /// A staged call: its rows, streams, tiles, the latest row's position and the partials' stride.
+-pub const Plan = struct { n: usize, ni: usize, nt: usize, last: usize, stride: u32 };
++pub const Plan = struct { n: usize, ni: usize, nt: usize, last: usize, stride: u32, off: i64 = 0 };
+ 
+ /// The drafter's taps: the visit each tap before the head's reads (unused entries match none), and the tap count.
+ pub const Taps = struct { at: [7]u32 = @splat(std.math.maxInt(u32)), n: u32 = 8 };
+@@ -387,7 +394,7 @@ pub const Forward = struct {
+         try host.appendSlice(gpa, std.mem.sliceAsBytes(cs[0..ni]));
+         try host.appendSlice(gpa, std.mem.sliceAsBytes(tl[0..nt]));
+         std.debug.assert(host.items.len == lay.end);
+-        const p: Plan = .{ .n = n, .ni = ni, .nt = nt, .last = last, .stride = stride(c, last) };
++        const p: Plan = .{ .n = n, .ni = ni, .nt = nt, .last = last, .stride = stride(c, last), .off = segs[1][0].off };
+         if (n * f.shape.heads * p.stride > f.b.parts.slots) return error.Inkling2Partials;
+         try f.stream.synchronize(); // the previous call's kernels may still read the staged rows
+         try f.b.ids.upload(0, host.items);
+@@ -406,6 +413,7 @@ pub const Forward = struct {
+         const lay = layout(n, p.ni, p.nt);
+         var rows_by: [2]kernels.Rows = undefined;
+         for (&rows_by, lay.segs) |*r, at| r.* = .{ .rows = @intCast(n), .heads = @intCast(f.shape.heads), .kv_heads = @intCast(f.shape.kv), .pos = base + n * 4, .seg_of = base + n * 8, .segs = base + at, .tiles = base + lay.tiles, .n_tiles = @intCast(p.nt), .last_pos = @intCast(p.last), .streams = @intCast(p.ni) };
++        rows_by[1].off = p.off; // the global segment's cache offset (a widened prompt call reads it)
+         const conv_segs = base + lay.conv;
+         const streams = p.ni;
+         try ops.embed(k, s, base, n, f.w.embed, f.w.embed_norm, b.x, h, c.eps);
+@@ -480,7 +488,10 @@ pub const Forward = struct {
+             const prep: kernels.Prep = .{ .qk_clip = c.qk_clip, .rel_clip = c.rel_clip, .floor = c.log_floor, .alpha = c.log_alpha, .eps = c.eps };
+             try kernels.prep(&f.m.attn, s, rows, lay_i, prep, .{ b.q, b.kraw, b.vraw, b.r }, .{ a.q_scale, a.rel_scale }, b.qo, b.relo, st.cache(sl));
+             try kernels.relTable(&f.m.attn, s, rows, b.relo, a.rel_proj, b.tab);
+-            try kernels.attend(&f.m.attn, s, rows, lay_i, p.stride, b.parts.slots, b.qo, st.cache(sl), b.tab, b.parts.o, b.parts.ml, b.sink, b.gate, b.att);
++            var kv = st.cache(sl);
++            if (global) kv.wide = b.wide; // 0 unless this call's scratch widens fp8 keys (prompt rows, Shape.widen)
++            kv.wide_half = b.wide_half;
++            try kernels.attend(&f.m.attn, s, rows, lay_i, p.stride, b.parts.slots, b.qo, kv, b.tab, b.parts.o, b.parts.ml, b.sink, b.gate, b.att);
+             try f.dense(a.o, b.att, n, f.slot(b.ao, n), .f32);
+             const ao = try f.summed(b.ao, n);
+             const boundary = i % c.block_layers == 0;
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 6170e6b20..044812628 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -54,8 +54,8 @@ pub const Layer = struct {
+     }
+ };
+ 
+-/// A layer's caches (addresses): K and V rows, and with fp8 rows each one's scales [slot][kv_head] (fp32).
+-pub const Cache = struct { k: u64, v: u64, ks: u64 = 0, vs: u64 = 0 };
++/// A layer's caches: K and V rows, fp8 rows' scales [slot][kv_head], and bf16 room for widened keys.
++pub const Cache = struct { k: u64, v: u64, ks: u64 = 0, vs: u64 = 0, wide: u64 = 0, wide_half: u64 = 0 };
+ 
+ /// Sliding ring slots: the window plus a call's rows less one, so a chunk never overwrites keys it still reads.
+ pub fn ringFor(window: u32, rows: u32) u32 {
+@@ -107,6 +107,7 @@ pub const Kernels = struct {
+     pmod: cuda.Module,
+     attn_prompt: cuda.Function,
+     attn_prompt8: cuda.Function,
++    widen: cuda.Function,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -123,6 +124,7 @@ pub const Kernels = struct {
+             .pmod = pmod,
+             .attn_prompt = attn_prompt,
+             .attn_prompt8 = attn_prompt8,
++            .widen = try pmod.function("tf_ink2_kv_widen"),
+             .prep = try mod.function("tf_ink2_prep"),
+             .rel_table = try mod.function("tf_ink2_rel_table"),
+             .attn = try mod.function("tf_ink2_attn"),
+@@ -156,6 +158,7 @@ pub const Rows = struct {
+     n_tiles: u32,
+     last_pos: u32, // the call's latest row position (a global layer's chunks run to it)
+     streams: u32 = 1, // segments in `segs`: one stream's prompt rows take the prompt kernel
++    off: i64 = 0, // the first segment's cache offset (elements), as staged in `segs`
+ };
+ 
+ fn int(x: anytype) c_int {
+@@ -222,8 +225,18 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
+         p.add(scale);
+         if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| p.add(v);
+         const blocks = std.math.divCeil(u32, r.rows * (r.heads / r.kv_heads), prompt_pairs) catch unreachable;
+-        const f = if (l.kv8) k.attn_prompt8 else k.attn_prompt;
+-        try goShared(f, s, .{ .x = blocks, .y = r.kv_heads, .z = stride }, prompt_threads, prompt_shared, &p);
++        if (l.kv8 and kv.wide != 0) { // keys widened to bf16 once a call, then the bf16 kernel: the same tile values
++            try widen(k, s, r, l, kv);
++            var w: cuda.Args = .{};
++            const back: u64 = @intCast(r.off * 2); // the kernel adds the segment's offset back
++            for ([_]u64{ q, kv.wide -% back, kv.wide + kv.wide_half -% back, tab, r.segs, part_o, part_ml }) |v| w.add(v);
++            for ([_]u32{ r.heads, r.kv_heads, l.ring, l.chunk, 0, stride }) |v| w.add(int(v));
++            w.add(scale);
++            try goShared(k.attn_prompt, s, .{ .x = blocks, .y = r.kv_heads, .z = stride }, prompt_threads, prompt_shared, &w);
++        } else {
++            const f = if (l.kv8) k.attn_prompt8 else k.attn_prompt;
++            try goShared(f, s, .{ .x = blocks, .y = r.kv_heads, .z = stride }, prompt_threads, prompt_shared, &p);
++        }
+     } else { // a block a chunk, its sub-chunks folded in order
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, l.chunk, 0, stride }) |v| a.add(int(v));
+         a.add(scale);
+@@ -236,6 +249,18 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
+     try go(k.merge, s, .{ .x = r.rows * r.heads }, head_dim, &b);
+ }
+ 
++/// One stream's fp8 keys 0..last_pos as bf16 [kv_head][ring][128]: K at kv.wide, V at kv.wide + kv.wide_half.
++fn widen(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, kv: Cache) !void {
++    var a: cuda.Args = .{};
++    for ([_]u64{ kv.k, kv.v, kv.ks, kv.vs }) |v| a.add(v);
++    a.add(r.off);
++    a.add(int(r.kv_heads));
++    a.add(int(l.ring));
++    a.add(int(r.last_pos));
++    for ([_]u64{ kv.wide, kv.wide + kv.wide_half }) |v| a.add(v);
++    try go(k.widen, s, .{ .x = r.last_pos / tile_keys + 1, .y = r.kv_heads, .z = 2 }, 512, &a);
++}
++
+ /// Whether a global call runs a block a sub-chunk: few rows, and partials for every row, head and sub-chunk.
+ pub fn split(r: Rows, stride: u32, slots: usize) bool {
+     return r.rows <= split_rows and @as(usize, r.rows) * r.heads * stride * subs <= slots;
+diff --git a/zig/src/families/inkling2/kernels_test.zig b/zig/src/families/inkling2/kernels_test.zig
+index e235f54cb..ffc2c5045 100644
+--- a/zig/src/families/inkling2/kernels_test.zig
++++ b/zig/src/families/inkling2/kernels_test.zig
+@@ -60,7 +60,7 @@ test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks fo
+             return .{ .d = drv, .handle = @ptrFromInt(i) };
+         }
+     };
+-    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .prep8 = fun.of(&d, 5), .attn8 = fun.of(&d, 6), .attn_fold8 = fun.of(&d, 7), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3), .attn_prompt8 = fun.of(&d, 8) };
++    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .prep8 = fun.of(&d, 5), .attn8 = fun.of(&d, 6), .attn_fold8 = fun.of(&d, 7), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3), .attn_prompt8 = fun.of(&d, 8), .widen = fun.of(&d, 9) };
+     const s: cuda.Stream = .{ .d = &d, .handle = null };
+     const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575 };
+     const l = k.Layer.global(1048576, false);
+-- 
+2.53.0
+

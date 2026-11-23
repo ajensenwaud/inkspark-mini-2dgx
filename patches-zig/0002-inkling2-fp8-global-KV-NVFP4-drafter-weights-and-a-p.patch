@@ -1,7 +1,7 @@
 From 9bdb698dd0f553bdcf497c38a7181cee09a04ca8 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 09:03:51 +1100
-Subject: [PATCH 02/24] inkling2: fp8 global KV, NVFP4 drafter weights and a
+Subject: [PATCH 02/29] inkling2: fp8 global KV, NVFP4 drafter weights and a
  profile mode as recipe switches
 
 The release build's levers, back as registered settings, all off by default:

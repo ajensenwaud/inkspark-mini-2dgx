@@ -53,12 +53,12 @@ the KL table above.
 
 | | |
 |---|---|
-| One stream, short prompt, greedy (chat / code / agent) | 77 / 89 / 70 tok/s with the drafter |
-| One stream at temperature 1.0 (chat / code / agent) | 68 / 94 / 79 tok/s |
-| Two streams at once, greedy | 116 tok/s in total with the drafter |
-| Eight streams at once (8 x 128K windows) | 232 tok/s in total |
+| One stream, short prompt, greedy (chat / code / agent) | 73 / 95 / 78 tok/s with the drafter |
+| One stream at temperature 1.0 (chat / code / agent) | 70 / 83 / 80 tok/s |
+| Two streams at once, greedy | 111 tok/s in total with the drafter |
+| Eight streams at once (8 x 128K windows) | 242 tok/s in total |
 | Decode at 128K / 512K / 1M context | 59.0 / 25.1 / 16.7 tok/s |
-| Reading a cold prompt, 128K / 1M | 1,638 tok/s (80 s) / 899 tok/s (19 min) |
+| Reading a cold prompt, 120K / 950K tokens | 1,646 tok/s (73 s) / 981 tok/s (16 min) |
 
 Follow-up turns resume from the prompt cache in seconds. Performance varies for cold long prompts.
 

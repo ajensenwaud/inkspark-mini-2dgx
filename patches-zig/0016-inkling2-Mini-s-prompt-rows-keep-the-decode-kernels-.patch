@@ -1,7 +1,7 @@
 From e571cc3838706c62cec1aa2a976c83ce09fae170 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 19:46:15 +1100
-Subject: [PATCH 16/24] inkling2: Mini's prompt rows keep the decode kernels,
+Subject: [PATCH 16/29] inkling2: Mini's prompt rows keep the decode kernels,
  so a prompt pass gives decode rows' bits at two ranks
 
 ---

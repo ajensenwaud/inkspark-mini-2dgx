@@ -1,7 +1,7 @@
 From a232b5f2d7fb2ba38d12f305249d77ae1576129e Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 14:21:36 +1100
-Subject: [PATCH 10/24] inkling2: take the vision tower's output width from its
+Subject: [PATCH 10/29] inkling2: take the vision tower's output width from its
  projector
 
 Small's projector writes 4,608-wide rows and Mini's 2,304. The tower reads the width from proj_out's rows,

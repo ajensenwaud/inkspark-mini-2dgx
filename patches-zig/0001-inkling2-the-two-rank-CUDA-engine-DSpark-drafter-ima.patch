@@ -1,7 +1,7 @@
 From b0745314c726936ac1fc3b7b6475b41b6dccf1b1 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 07:10:03 +1100
-Subject: [PATCH 01/24] inkling2: the two-rank CUDA engine, DSpark drafter,
+Subject: [PATCH 01/29] inkling2: the two-rank CUDA engine, DSpark drafter,
  images and reply split
 
 Carried from the gated release build by way of its near-main form: the family's own kernels and their contract registrations, the two-rank runtime with lanes, the bundled DSpark drafter, the image path and the reply and tool-call split. Lossy and timing switches come in later commits.

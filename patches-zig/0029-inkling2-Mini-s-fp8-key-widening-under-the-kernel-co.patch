@@ -1,0 +1,249 @@
+From 5ef10b4bb15bf735716e24869ba864fdea6e3f61 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:55:18 +1100
+Subject: [PATCH 29/29] inkling2: Mini's fp8 key widening under the kernel
+ contract
+
+The widening kernel gets a float64 reference, a control that swaps the
+K and V scales, and nvcc 13.0 and 13.3 records. It needs sm_89 for the
+e4m3 conversion, like the rest of the fp8 prompt path.
+---
+ .../core/contract/inkling2_attn_records.zig   |   2 +
+ .../contract/measurements/pending_133.zig     |   1 +
+ zig/src/families/inkling2/kernels.zig         |  16 +--
+ zig/tests/cuda/contract_inkling2_attn.zig     |   7 ++
+ .../cuda/contract_inkling2_attn_widen.zig     | 114 ++++++++++++++++++
+ 5 files changed, 132 insertions(+), 8 deletions(-)
+ create mode 100644 zig/tests/cuda/contract_inkling2_attn_widen.zig
+
+diff --git a/zig/src/core/contract/inkling2_attn_records.zig b/zig/src/core/contract/inkling2_attn_records.zig
+index ae23e3880..585b967ff 100644
+--- a/zig/src/core/contract/inkling2_attn_records.zig
++++ b/zig/src/core/contract/inkling2_attn_records.zig
+@@ -9,6 +9,8 @@ pub const cuda = [_]registry.CudaRecord{
+     .{ .launch = .{ .name = "inkling2_attn tf_ink2_attn_fold", .symbol = "tf_ink2_attn_fold", .image = "inkling2_attn", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 254, .static = 34816, .bound = 128 }, .{ .regs = 254, .static = 34816, .bound = 128 }, .{ .regs = 254, .static = 34816, .bound = 128 }, .{ .regs = 255, .static = 34816, .bound = 128 }, .{ .regs = 255, .static = 34816, .bound = 128 } } },
+     .{ .launch = .{ .name = "inkling2_attn tf_ink2_merge", .symbol = "tf_ink2_merge", .image = "inkling2_attn", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 32, .static = 0 }, .{ .regs = 40, .static = 0 }, .{ .regs = 40, .static = 0 }, .{ .regs = 40, .static = 0 }, .{ .regs = 40, .static = 0 } } },
+     .{ .launch = .{ .name = "inkling2_pattn tf_ink2_attn_prompt", .symbol = "tf_ink2_attn_prompt", .image = "inkling2_pattn", .threads = 256, .dynamic = 98304, .opt_in = true, .min_sm = 80 }, .usage = .{ .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 }, .{ .regs = 255, .static = 0, .bound = 256 } } },
++    // Mini's fp8 prompt rows: e4m3 conversion needs sm_89, so sm_80/86 hold no image; 13.3 in pending_133
++    .{ .launch = .{ .name = "inkling2_pattn tf_ink2_kv_widen", .symbol = "tf_ink2_kv_widen", .image = "inkling2_pattn", .threads = 512, .min_sm = 89 }, .usage = .{ .{ .regs = 0, .static = 0 }, .{ .regs = 0, .static = 0 }, .{ .regs = 38, .static = 0, .bound = 512 }, .{ .regs = 38, .static = 0, .bound = 512 }, .{ .regs = 38, .static = 0, .bound = 512 } }, .later_pending = true },
+ };
+ /// nvcc 13.2's, where it differs: pending, as no 13.2 compiler has measured these images.
+ pub const cuda_132 = [_]registry.Override{};
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index 685810753..0a0bab031 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -97,5 +97,6 @@ pub const records = [_]Override{
+     .{ .name = "inkling2 dspark tf_ink2_dsp_merge_many", .usage = .{ .{ .regs = 32, .static = 0, .bound = 128 }, .{ .regs = 36, .static = 0, .bound = 128 }, .{ .regs = 36, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 } } },
+     .{ .name = "inkling2 dspark tf_ink2_dsp_ctx_many", .usage = .{ .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 48, .static = 0, .bound = 256 }, .{ .regs = 48, .static = 0, .bound = 256 } } },
+     .{ .name = "inkling2 dspark tf_ink2_dsp_rnn_many", .usage = .{ .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 } } },
++    .{ .name = "inkling2_pattn tf_ink2_kv_widen", .usage = .{ .{ .regs = 0, .static = 0 }, .{ .regs = 0, .static = 0 }, .{ .regs = 38, .static = 0, .bound = 512 }, .{ .regs = 38, .static = 0, .bound = 512 }, .{ .regs = 38, .static = 0, .bound = 512 } } },
+     .{ .name = "inkling2 dspark tf_ink2_dsp_pick_many", .usage = .{ .{ .regs = 23, .static = 256, .bound = 1024 }, .{ .regs = 24, .static = 256, .bound = 1024 }, .{ .regs = 24, .static = 256, .bound = 1024 }, .{ .regs = 25, .static = 256, .bound = 1024 }, .{ .regs = 25, .static = 256, .bound = 1024 } } },
+ };
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 044812628..6b600012f 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -226,7 +226,7 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
+         if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| p.add(v);
+         const blocks = std.math.divCeil(u32, r.rows * (r.heads / r.kv_heads), prompt_pairs) catch unreachable;
+         if (l.kv8 and kv.wide != 0) { // keys widened to bf16 once a call, then the bf16 kernel: the same tile values
+-            try widen(k, s, r, l, kv);
++            try widen(k, s, kv, r.off, r.kv_heads, l.ring, r.last_pos);
+             var w: cuda.Args = .{};
+             const back: u64 = @intCast(r.off * 2); // the kernel adds the segment's offset back
+             for ([_]u64{ q, kv.wide -% back, kv.wide + kv.wide_half -% back, tab, r.segs, part_o, part_ml }) |v| w.add(v);
+@@ -249,16 +249,16 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
+     try go(k.merge, s, .{ .x = r.rows * r.heads }, head_dim, &b);
+ }
+ 
+-/// One stream's fp8 keys 0..last_pos as bf16 [kv_head][ring][128]: K at kv.wide, V at kv.wide + kv.wide_half.
+-fn widen(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, kv: Cache) !void {
++/// One stream's fp8 keys 0..last (cache offset `off`) as bf16 [kv_head][ring][128]: K at kv.wide, V after it.
++pub fn widen(k: *const Kernels, s: cuda.Stream, kv: Cache, off: i64, kv_heads: u32, ring: u32, last: u32) !void {
+     var a: cuda.Args = .{};
+     for ([_]u64{ kv.k, kv.v, kv.ks, kv.vs }) |v| a.add(v);
+-    a.add(r.off);
+-    a.add(int(r.kv_heads));
+-    a.add(int(l.ring));
+-    a.add(int(r.last_pos));
++    a.add(off);
++    a.add(int(kv_heads));
++    a.add(int(ring));
++    a.add(int(last));
+     for ([_]u64{ kv.wide, kv.wide + kv.wide_half }) |v| a.add(v);
+-    try go(k.widen, s, .{ .x = r.last_pos / tile_keys + 1, .y = r.kv_heads, .z = 2 }, 512, &a);
++    try go(k.widen, s, .{ .x = last / tile_keys + 1, .y = kv_heads, .z = 2 }, 512, &a);
+ }
+ 
+ /// Whether a global call runs a block a sub-chunk: few rows, and partials for every row, head and sub-chunk.
+diff --git a/zig/tests/cuda/contract_inkling2_attn.zig b/zig/tests/cuda/contract_inkling2_attn.zig
+index 3c339b46e..96e4f6408 100644
+--- a/zig/tests/cuda/contract_inkling2_attn.zig
++++ b/zig/tests/cuda/contract_inkling2_attn.zig
+@@ -6,6 +6,8 @@ const g = @import("core").contract.gates;
+ const K = @import("inkling2").kernels;
+ const rows = @import("contract_inkling2_attn_rows.zig");
+ const prep = @import("contract_inkling2_attn_prep.zig");
++const widen = @import("contract_inkling2_attn_widen.zig");
++const ref = @import("contract_minimax_glue_ref.zig");
+ 
+ /// The attention launches as the forward makes them: prep, the bias table, then the chunks and their merge.
+ pub const Set = struct {
+@@ -14,6 +16,7 @@ pub const Set = struct {
+     attns: [7]rows.Attn = undefined,
+     preps: [3]prep.Prep = undefined,
+     tables: [2]prep.Table = undefined,
++    widens: [2]ref.Gated(widen.Widen) = undefined,
+ 
+     /// Every registration (the fold first: the split and prompt launches must equal its bits), then the controls.
+     pub fn init(set: *Set, gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
+@@ -22,14 +25,17 @@ pub const Set = struct {
+         for (&set.attns, forms) |*x, f| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .k = &set.k, .path = f[0], .plant = f[1] };
+         for (&set.preps, [_]bool{ false, true, true }, 0..) |*x, global, i| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .k = &set.k, .global = global, .tau_off = i == 2 };
+         for (&set.tables, 0..) |*x, i| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .k = &set.k, .late = i == 1 };
++        for (&set.widens, 0..) |*x, i| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .k = .{ .kern = &set.k, .swapped = i == 1 } };
+         set.loaded = true;
+         errdefer set.deinit();
+         for (set.preps[0..2]) |*x| try list.append(a, x.kernel());
+         try list.append(a, set.tables[0].kernel());
+         for (set.attns[0..4]) |*x| try list.append(a, x.kernel());
++        try list.append(a, set.widens[0].kernel());
+         try list.append(a, set.preps[2].kernel());
+         try list.append(a, set.tables[1].kernel());
+         for (set.attns[4..]) |*x| try list.append(a, x.kernel());
++        try list.append(a, set.widens[1].kernel());
+     }
+ 
+     pub fn deinit(set: *Set) void {
+@@ -37,6 +43,7 @@ pub const Set = struct {
+         for (&set.attns) |*x| x.deinit();
+         for (&set.preps) |*x| x.deinit();
+         for (&set.tables) |*x| x.deinit();
++        for (&set.widens) |*x| x.deinit();
+         set.k.unload();
+         set.loaded = false;
+     }
+diff --git a/zig/tests/cuda/contract_inkling2_attn_widen.zig b/zig/tests/cuda/contract_inkling2_attn_widen.zig
+new file mode 100644
+index 000000000..87db3771f
+--- /dev/null
++++ b/zig/tests/cuda/contract_inkling2_attn_widen.zig
+@@ -0,0 +1,114 @@
++//! Inkling 2 Mini's fp8 key widening (prompt_attention.cu tf_ink2_kv_widen) under the contract, with its control.
++const std = @import("std");
++const core = @import("core");
++const K = @import("inkling2").kernels;
++const rig_ = @import("contract_rig.zig");
++const ref = @import("contract_minimax_glue_ref.zig");
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const Iv = ref.Iv;
++const Sums = ref.Sums;
++const dim = K.head_dim;
++
++/// A slot's keys (rows) x a rank's key heads (n, 4 at TP=2): the first prompt chunk, and keys past a 64-key tile edge.
++pub fn specFor(swapped: bool) c.Spec {
++    const served = &[_]c.Shape{ .{ .rows = 2048, .n = 4, .k = 1 }, .{ .rows = 4161, .n = 4, .k = 1 } };
++    const name = if (swapped) "inkling2_pattn control: widening reads V's scales for K and K's for V" else "inkling2_pattn tf_ink2_kv_widen (e4m3 to f16, times the fp32 scale, to bf16)";
++    return .{ .name = name, .accum = .none, .depth = ref.noSums, .out = .bf16, .served = served };
++}
++
++/// e4m3fn code to its value (no infinities; 0x7f and 0xff are NaN).
++pub fn e4m3(code: u8) f64 {
++    const e: i32 = (code >> 3) & 15;
++    const m: f64 = @floatFromInt(code & 7);
++    if (e == 15 and code & 7 == 7) return std.math.nan(f64);
++    const v = if (e == 0) m / 8 * 0x1p-6 else (1 + m / 8) * std.math.pow(f64, 2, @floatFromInt(e - 7));
++    return if (code & 0x80 != 0) -v else v;
++}
++
++/// Out: K then V, each bf16 [kv_head][ring = rows][128]; inputs hold two slots and the launch reads slot 1.
++pub const Widen = struct {
++    kern: *const K.Kernels,
++    /// control: the device's scale arrays are passed the other way round
++    swapped: bool = false,
++    shape: c.Shape = undefined,
++    codes: [2][]u8 = .{ &.{}, &.{} },
++    scales: [2][]f32 = .{ &.{}, &.{} },
++    dev: [4]u64 = @splat(0),
++    out: u64 = 0,
++
++    pub fn spec(self: *const Widen) c.Spec {
++        return specFor(self.swapped);
++    }
++
++    pub fn control(self: *const Widen) ?g.Gate {
++        return if (self.swapped) .shapes else null;
++    }
++
++    pub fn free(self: *Widen, a: std.mem.Allocator) void {
++        for (&self.codes) |*x| a.free(x.*);
++        for (&self.scales) |*x| a.free(x.*);
++        self.codes = .{ &.{}, &.{} };
++        self.scales = .{ &.{}, &.{} };
++    }
++
++    /// Slot 0 NaN codes, slot 1 finite codes and scales; non-finite: NaN codes, an infinite scale over zero codes.
++    pub fn prepare(self: *Widen, a: std.mem.Allocator, rig: *rig_.Rig, shape: c.Shape, fill: g.Fill, rng: std.Random) !bool {
++        if (shape.rows == 0 or shape.n == 0) return false;
++        self.free(a);
++        self.shape = shape;
++        const per = shape.rows * shape.n;
++        for (&self.codes, &self.scales, 0..) |*cs, *ss, side| {
++            cs.* = try a.alloc(u8, 2 * per * dim);
++            ss.* = try a.alloc(f32, 2 * per);
++            @memset(cs.*[0 .. per * dim], 0x7f);
++            for (cs.*[per * dim ..]) |*x| {
++                var v = rng.int(u8);
++                while (v & 0x7f == 0x7f) v = rng.int(u8);
++                x.* = v;
++            }
++            const lo: f32, const hi: f32 = if (side == 0) .{ 0x1p-6, 0.5 } else .{ 0.6, 1.2 };
++            for (ss.*) |*x| x.* = lo + rng.float(f32) * (hi - lo);
++        }
++        if (fill == .nonfinite) {
++            self.codes[0][per * dim + 5] = 0x7f;
++            self.codes[1][per * dim + per * dim / 2] = 0xff;
++            const row = per - 1; // the last key's last head: zero codes times an infinite scale
++            @memset(self.codes[0][(per + row) * dim ..][0 .. dim / 2], 0);
++            self.scales[0][per + row] = ref.inf;
++        }
++        for (0..2) |i| self.dev[i] = try ref.input(rig, self.codes[i]);
++        const ks: usize = if (self.swapped) 1 else 0;
++        self.dev[2] = try ref.input(rig, self.scales[ks]);
++        self.dev[3] = try ref.input(rig, self.scales[1 - ks]);
++        self.out = try rig.output(2 * per * dim * 2);
++        return true;
++    }
++
++    pub fn run(self: *Widen, rig: *rig_.Rig) !void {
++        const per = self.shape.rows * self.shape.n;
++        const half: u64 = per * dim * 2;
++        const kv: K.Cache = .{ .k = self.dev[0], .v = self.dev[1], .ks = self.dev[2], .vs = self.dev[3], .wide = self.out, .wide_half = half };
++        const rows: u32 = @intCast(self.shape.rows);
++        try K.widen(self.kern, rig.s, kv, @intCast(per * dim), @intCast(self.shape.n), rows, rows - 1);
++    }
++
++    pub fn count(self: *const Widen) usize {
++        return 2 * self.shape.rows * self.shape.n * dim;
++    }
++
++    pub fn solve(self: *const Widen, _: std.mem.Allocator, _: Sums, out: []Iv) !void {
++        const rows = self.shape.rows;
++        const n = self.shape.n;
++        const per = rows * n;
++        for (0..2) |side| for (0..n) |h| for (0..rows) |key| {
++            const src = per + key * n + h;
++            const sc = Iv.of(self.scales[side][src]);
++            for (0..dim) |d| {
++                const at = ((side * n + h) * rows + key) * dim + d;
++                out[at] = Iv.of(e4m3(self.codes[side][src * dim + d])).mul(sc).bf();
++            }
++        };
++    }
++};
+-- 
+2.53.0
+

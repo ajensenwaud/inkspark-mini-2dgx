@@ -1,7 +1,7 @@
 From 95da7a248280a47ece83272b699217582107359c Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 09:31:52 +1100
-Subject: [PATCH 04/24] inkling2: Mini's loop kernels, message attention and
+Subject: [PATCH 04/29] inkling2: Mini's loop kernels, message attention and
  the four message gates
 
 loop.cu holds the cross-pass message attention and the rank-64 gates in

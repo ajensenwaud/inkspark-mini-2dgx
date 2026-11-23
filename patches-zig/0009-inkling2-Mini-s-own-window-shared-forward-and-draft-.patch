@@ -1,7 +1,7 @@
 From 3d2b6a7816d38095484de9b768d71296a15c98c1 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 15:01:24 +1100
-Subject: [PATCH 09/24] inkling2: Mini's own window, shared-forward and
+Subject: [PATCH 09/29] inkling2: Mini's own window, shared-forward and
  draft-pass costs for the depth rule
 
 Timed on pack A at two ranks (tf-inkling2-engine timing, graphed, medians of 16): one row 17.9 ms, eight 33.2 ms,

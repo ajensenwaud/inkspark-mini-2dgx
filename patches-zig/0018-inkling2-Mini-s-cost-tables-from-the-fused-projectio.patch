@@ -1,7 +1,7 @@
 From bc093ba05bba7913333310e13685eb70be112cb3 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 19:46:16 +1100
-Subject: [PATCH 18/24] inkling2: Mini's cost tables from the fused projections
+Subject: [PATCH 18/29] inkling2: Mini's cost tables from the fused projections
  and the NVFP4 drafter's pass
 
 ---

@@ -1,7 +1,7 @@
 From fe368c4f87db65eb1e5450d67abc7845b51d467d Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 16:29:05 +1100
-Subject: [PATCH 11/24] inkling2: Mini's prompt GEMM rounds its input as the
+Subject: [PATCH 11/29] inkling2: Mini's prompt GEMM rounds its input as the
  decode kernels do
 
 The prompt GEMM rounds the rotated input to fp16 at 2^-4 (tf_exl3_rotate_h,

@@ -1,0 +1,127 @@
+From ab12df6f821ba0fbd5d199a954c3aa2e8bfc44ee Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:02:18 +1100
+Subject: [PATCH 25/29] inkling2: back up a slot's conv states in one launch
+
+A window of several rows saved each slot's conv states with one device copy
+a site, 192 on Mini, each a few microseconds of host time on the decode
+stream: about 0.6 ms a drafting stream every round, 5.9 ms at eight. The
+rewind kernel already copies a site's three rows from the backup; a second
+site table with the two sides swapped makes it copy the other way, so one
+launch a stream does the save with the same bytes. Shared 8 x 2 rows
+46.5 -> 40.6 ms, 4 x 2 35.9 -> 32.9, one stream x 2 20.9 -> 20.0.
+TF_INKLING2_CONV_SAVE=0 keeps the per-site copies.
+---
+ docs/environment.md                   |  1 +
+ zig/src/families/inkling2/engine.zig  | 34 ++++++++++++++++++++++++++-
+ zig/src/platform/environment.zig      |  1 +
+ zig/src/platform/environment_test.zig |  1 +
+ 4 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index ac4df3c1a..6f2f9ce0e 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -83,6 +83,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TF_INKLING2_PROFILE` | Inkling 2 on CUDA: `1` times a round's phases on each rank and logs a line every 200 rounds (syncs the forward; off by default) |
+ | `TF_INKLING2_PLAIN_STREAMS` | Inkling 2 on CUDA: shared decode rounds of this many streams or more draft nothing; `0` lets every width draft. Unset: 2 on Small (from two streams on, rounds run plain), 4 on Mini (its batched pass drafts at one to three streams; from four on, each verify row costs more than the drafts give back). Changes speed, never output |
+ | `TF_INKLING2_DRAFT_BATCH` | Inkling 2 Mini on CUDA: `0` runs the draft pass's absorbs, attention and walk launches one stream at a time, as before the batched pass; unset or `1` puts every stream through each launch once. Small always keeps its released pass. Changes speed, never output or drafts |
++| `TF_INKLING2_CONV_SAVE` | Inkling 2 on CUDA: `0` backs up a slot's conv states before a window of several rows with one device copy a conv site (192 on Mini); unset or `1` copies them all in one launch of the rewind kernel. Changes speed, never output |
+ | `TF_PROMPT_ROWS` | Native serving: a multiple of 16 from 128 through 2048; unset keeps the chip/family default |
+ | `TF_ANE_COLUMNS` | Whole u32 count; zero disables the experimental share; default zero |
+ | `TF_METAL4` | Metal: exactly `0` or `1`; `1` sends a family's GPU work through Metal 4 (macOS 26 and later) where the family supports it: the same kernels in the same order, with Metal 4's command queue, allocators, argument tables and barriers, and bit-identical outputs; `0` keeps Metal 3. DeepSeek-V4.1 defaults to `1` where the Mac has Metal 4 (its device test rigs to `0`); Macs without it stay on Metal 3 |
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index e4de722a3..3b388ed63 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -85,6 +85,7 @@ pub const Engine = struct {
+     rows: []pictures.Rows = &.{},
+     calls: u64 = 0, // decode calls on bd so far
+     sites: ?cuda.DeviceBuffer = null, // every conv site's ops.RewindSite (keep without a forward)
++    saves: ?cuda.DeviceBuffer = null, // per slot, rewind's sites read the other way: its states into its backup
+ 
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, rank: usize, world: usize, o: Options) !*Engine {
+         const e = try gpa.create(Engine);
+@@ -151,6 +152,7 @@ pub const Engine = struct {
+         if (e.st) |*s| s.deinit();
+         if (e.backup) |*b| b.free();
+         if (e.sites) |*b| b.free();
++        if (e.saves) |*b| b.free();
+         e.gpa.free(e.seqs);
+         e.gpa.free(e.spans);
+         e.smp.deinit();
+@@ -228,6 +230,12 @@ pub const Engine = struct {
+             e.sites.?.free();
+             e.sites = null;
+         }
++        comptime @import("sys").environment.registered("TF_INKLING2_CONV_SAVE");
++        if (try @import("sys").environment.read(u64, "TF_INKLING2_CONV_SAVE", 1) == 1) e.saves = try e.saveTable(slots);
++        errdefer if (e.saves) |*b| {
++            b.free();
++            e.saves = null;
++        };
+         if (e.vision) |l| e.rows = try pictures.makeRows(e.gpa, e.d, l, slots, e.c.hidden);
+         e.seqs = try e.gpa.alloc(Seq, slots);
+         @memset(e.seqs, .{});
+@@ -407,9 +415,33 @@ pub const Engine = struct {
+         return cuda.DeviceBuffer.fromHost(e.d, std.mem.sliceAsBytes(sites));
+     }
+ 
+-    /// The slot's conv states to (out) or from its backup.
++    /// Each slot's sites as rewind's kernel reads them at n = 0: `state` its backup rows, `backup` its state's offset.
++    fn saveTable(e: *Engine, slots: usize) !cuda.DeviceBuffer {
++        const st = &e.st.?;
++        const n_sites = @as(usize, e.c.visits()) * 4;
++        const sites = try e.gpa.alloc(ops.RewindSite, slots * n_sites);
++        defer e.gpa.free(sites);
++        const base = e.backup.?.ptr;
++        for (0..slots) |slot| {
++            var off: usize = slot * e.convBytes();
++            for (st.conv, 0..) |cv, i| for (cv, 0..) |state, j| {
++                const c = if (j < 2) st.kv * e.c.head_dim else @as(usize, e.c.hidden);
++                const src: i64 = @intCast(state + slot * 3 * c * 4);
++                sites[slot * n_sites + i * 4 + j] = .{ .state = base + off, .hist = 0, .backup = src - @as(i64, @intCast(base)), .c = @intCast(c) };
++                off += 3 * c * 4;
++            };
++        }
++        return cuda.DeviceBuffer.fromHost(e.d, std.mem.sliceAsBytes(sites));
++    }
++
++    /// The slot's conv states to (out) or from its backup; out in one launch when the save table is there.
+     fn convCopy(e: *Engine, slot: usize, out: bool) !void {
+         const st = &e.st.?;
++        if (out) if (e.saves) |t| {
++            const n_sites = @as(usize, e.c.visits()) * 4;
++            const at = t.ptr + slot * n_sites * @sizeOf(ops.RewindSite);
++            return ops.rewind(&e.m.ops, e.stream, at, n_sites, e.c.hidden, e.backup.?.ptr, e.bd.hist, 0, 0, 0);
++        };
+         var off: usize = slot * e.convBytes();
+         for (st.conv) |cv| for (cv, 0..) |base, j| {
+             const n = 3 * (if (j < 2) st.kv * e.c.head_dim else @as(usize, e.c.hidden)) * 4;
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 12aab32eb..3e13dcba7 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -284,6 +284,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_PROFILE", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (unset or blank is off)" },
+     .{ .name = "TF_INKLING2_PLAIN_STREAMS", .scope = .inkling2, .kind = .size, .max = 16, .forms = "a whole stream count from 0 to 16 (0: every width drafts; unset: the family's default)" },
+     .{ .name = "TF_INKLING2_DRAFT_BATCH", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (0 puts Mini's draft pass back on the per-stream absorbs and launches; default 1)" },
++    .{ .name = "TF_INKLING2_CONV_SAVE", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (0 backs up conv states before a several-row window one copy a site; default 1)" },
+ };
+ 
+ /// An alias the server refuses at `version` (semantic versions; a pre-release is before its release), else null.
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index efc96cc78..1cf6bb955 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -214,6 +214,7 @@ const valid = [_]Case{
+     .{ .name = "TF_INKLING2_PROFILE", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_PLAIN_STREAMS", .raw = "2", .n = 2 },
+     .{ .name = "TF_INKLING2_DRAFT_BATCH", .raw = "0", .n = 0 },
++    .{ .name = "TF_INKLING2_CONV_SAVE", .raw = "0", .n = 0 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
+-- 
+2.53.0
+

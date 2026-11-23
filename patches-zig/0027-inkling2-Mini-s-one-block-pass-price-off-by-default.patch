@@ -1,0 +1,77 @@
+From 57861c0eedf742307c0d8e098281e32ed81b0a21 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:42:37 +1100
+Subject: [PATCH 27/29] inkling2: Mini's one-block pass price off by default
+
+Served at four and eight streams with every width drafting, the block
+price gained 31 % on code and agent replies at four streams and 9 % on code
+at eight, but lost 6-7 % on prose, where the per-step price stays within
+1-2 % of plain rounds. Keep it as TF_INKLING2_FIXED_BLOCK=1 until the
+shared rule's chain rates track prose.
+---
+ docs/environment.md                   | 2 +-
+ zig/src/families/inkling2/lanes.zig   | 4 ++--
+ zig/src/platform/environment.zig      | 2 +-
+ zig/src/platform/environment_test.zig | 2 +-
+ 4 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index e1c0bc08d..1e750211e 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -84,7 +84,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TF_INKLING2_PLAIN_STREAMS` | Inkling 2 on CUDA: shared decode rounds of this many streams or more draft nothing; `0` lets every width draft. Unset: 2 on Small (from two streams on, rounds run plain), 4 on Mini (its batched pass drafts at one to three streams; from four on, each verify row costs more than the drafts give back). Changes speed, never output |
+ | `TF_INKLING2_DRAFT_BATCH` | Inkling 2 Mini on CUDA: `0` runs the draft pass's absorbs, attention and walk launches one stream at a time, as before the batched pass; unset or `1` puts every stream through each launch once. Small always keeps its released pass. Changes speed, never output or drafts |
+ | `TF_INKLING2_CONV_SAVE` | Inkling 2 on CUDA: `0` backs up a slot's conv states before a window of several rows with one device copy a conv site (192 on Mini); unset or `1` copies them all in one launch of the rewind kernel. Changes speed, never output |
+-| `TF_INKLING2_FIXED_BLOCK` | Inkling 2 Mini on CUDA: unset or `1` prices the batched draft pass in shared rounds as one block a round (its cost barely moves with depth), measured from the rounds; `0` prices it per head step as before. Changes speed, never output |
++| `TF_INKLING2_FIXED_BLOCK` | Inkling 2 Mini on CUDA: `1` prices the batched draft pass in shared rounds as one block a round (its cost barely moves with depth), measured from the rounds; unset or `0` prices it per head step. Off by default: at four and eight streams it gains 9-31 % on code and agent replies but loses 6-7 % on prose. Changes speed, never output |
+ | `TF_PROMPT_ROWS` | Native serving: a multiple of 16 from 128 through 2048; unset keeps the chip/family default |
+ | `TF_ANE_COLUMNS` | Whole u32 count; zero disables the experimental share; default zero |
+ | `TF_METAL4` | Metal: exactly `0` or `1`; `1` sends a family's GPU work through Metal 4 (macOS 26 and later) where the family supports it: the same kernels in the same order, with Metal 4's command queue, allocators, argument tables and barriers, and bit-identical outputs; `0` keeps Metal 3. DeepSeek-V4.1 defaults to `1` where the Mac has Metal 4 (its device test rigs to `0`); Macs without it stay on Metal 3 |
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 857534eb1..1160b9b19 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -44,11 +44,11 @@ pub fn plainStreams(mini: bool) !u32 {
+     return @intCast(try env.read(u64, "TF_INKLING2_PLAIN_STREAMS", if (mini) 4 else 2));
+ }
+ 
+-/// TF_INKLING2_FIXED_BLOCK: Mini's shared rounds price the draft pass as one block a round (default 1; 0: per step).
++/// TF_INKLING2_FIXED_BLOCK=1: Mini's shared rounds price the draft pass as one block a round (default 0: per step).
+ pub fn fixedBlock() !bool {
+     const env = @import("sys").environment;
+     comptime env.registered("TF_INKLING2_FIXED_BLOCK");
+-    return try env.read(u64, "TF_INKLING2_FIXED_BLOCK", 1) == 1;
++    return try env.read(u64, "TF_INKLING2_FIXED_BLOCK", 0) == 1;
+ }
+ 
+ /// A stream's place in the backend: its slot, the rows its last window left uncommitted, its first token.
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 7a3fdea16..50b2ad7a3 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -284,7 +284,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_PROFILE", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (unset or blank is off)" },
+     .{ .name = "TF_INKLING2_PLAIN_STREAMS", .scope = .inkling2, .kind = .size, .max = 16, .forms = "a whole stream count from 0 to 16 (0: every width drafts; unset: the family's default)" },
+     .{ .name = "TF_INKLING2_DRAFT_BATCH", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (0 puts Mini's draft pass back on the per-stream absorbs and launches; default 1)" },
+-    .{ .name = "TF_INKLING2_FIXED_BLOCK", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (0 prices Mini's shared draft pass per head step; default 1, one block a round)" },
++    .{ .name = "TF_INKLING2_FIXED_BLOCK", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (1 prices Mini's shared draft pass as one block a round; default 0, per head step)" },
+     .{ .name = "TF_INKLING2_CONV_SAVE", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (0 backs up conv states before a several-row window one copy a site; default 1)" },
+ };
+ 
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 3aced465c..761865d6e 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -215,7 +215,7 @@ const valid = [_]Case{
+     .{ .name = "TF_INKLING2_PLAIN_STREAMS", .raw = "2", .n = 2 },
+     .{ .name = "TF_INKLING2_DRAFT_BATCH", .raw = "0", .n = 0 },
+     .{ .name = "TF_INKLING2_CONV_SAVE", .raw = "0", .n = 0 },
+-    .{ .name = "TF_INKLING2_FIXED_BLOCK", .raw = "0", .n = 0 },
++    .{ .name = "TF_INKLING2_FIXED_BLOCK", .raw = "1", .n = 1 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
+-- 
+2.53.0
+

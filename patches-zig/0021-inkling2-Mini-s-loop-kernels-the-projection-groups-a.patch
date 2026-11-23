@@ -1,7 +1,7 @@
 From 83e5ea897be4d3ea3db757c16be82e12c461f02b Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 23:50:31 +1100
-Subject: [PATCH 21/24] inkling2: Mini's loop kernels, the projection groups
+Subject: [PATCH 21/29] inkling2: Mini's loop kernels, the projection groups
  and the batched draft walk under the kernel contract
 
 Gates 1-4 with float64 references and a planted control each: tf_ink2_loop_msg

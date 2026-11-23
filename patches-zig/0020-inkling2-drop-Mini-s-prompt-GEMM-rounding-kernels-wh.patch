@@ -1,7 +1,7 @@
 From 63c47dcb56f03a2b7f04eccb963211566752cd20 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 23:22:53 +1100
-Subject: [PATCH 20/24] inkling2: drop Mini's prompt GEMM rounding kernels,
+Subject: [PATCH 20/29] inkling2: drop Mini's prompt GEMM rounding kernels,
  which no path runs now
 
 Since Mini's prompt rows keep the decode kernels, tf_ink2_loop_rotate and

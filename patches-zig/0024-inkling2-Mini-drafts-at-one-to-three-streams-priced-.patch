@@ -1,7 +1,7 @@
 From 08b3e5774d418e3fe0a90c6a36ac3485c72de702 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 09:39:32 +1100
-Subject: [PATCH 24/24] inkling2: Mini drafts at one to three streams, priced
+Subject: [PATCH 24/29] inkling2: Mini drafts at one to three streams, priced
  from the batched pass
 
 The batched pass costs 7.4 ms for one stream and about 0.7 ms for each

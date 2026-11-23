@@ -1,0 +1,134 @@
+From cdfdfff9b443399b9b6fa7ebea3a9d03e944bf5a Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:02:19 +1100
+Subject: [PATCH 26/29] inkling2: Mini prices its draft pass as one block a
+ round, costs retimed
+
+Shared rounds priced Mini's batched pass at 1/7 of a full pass for each
+draft step, so one draft looked like 1 ms while the pass costs 5-12 ms.
+At four and eight streams the allocator then drafted one or two rows here
+and there, paid for whole passes, and lost to plain rounds. Mini now sets
+fixed_draft_block, so a drafting round pays the measured pass once and
+rows are priced from the table. The window and shared tables and the pass
+are retimed with the one-launch conv save. TF_INKLING2_FIXED_BLOCK=0 keeps
+the per-step price.
+---
+ docs/environment.md                   |  1 +
+ zig/src/families/inkling2/lanes.zig   | 23 ++++++++++++++++-------
+ zig/src/families/inkling2/native.zig  |  2 +-
+ zig/src/platform/environment.zig      |  1 +
+ zig/src/platform/environment_test.zig |  1 +
+ 5 files changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 6f2f9ce0e..e1c0bc08d 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -84,6 +84,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TF_INKLING2_PLAIN_STREAMS` | Inkling 2 on CUDA: shared decode rounds of this many streams or more draft nothing; `0` lets every width draft. Unset: 2 on Small (from two streams on, rounds run plain), 4 on Mini (its batched pass drafts at one to three streams; from four on, each verify row costs more than the drafts give back). Changes speed, never output |
+ | `TF_INKLING2_DRAFT_BATCH` | Inkling 2 Mini on CUDA: `0` runs the draft pass's absorbs, attention and walk launches one stream at a time, as before the batched pass; unset or `1` puts every stream through each launch once. Small always keeps its released pass. Changes speed, never output or drafts |
+ | `TF_INKLING2_CONV_SAVE` | Inkling 2 on CUDA: `0` backs up a slot's conv states before a window of several rows with one device copy a conv site (192 on Mini); unset or `1` copies them all in one launch of the rewind kernel. Changes speed, never output |
++| `TF_INKLING2_FIXED_BLOCK` | Inkling 2 Mini on CUDA: unset or `1` prices the batched draft pass in shared rounds as one block a round (its cost barely moves with depth), measured from the rounds; `0` prices it per head step as before. Changes speed, never output |
+ | `TF_PROMPT_ROWS` | Native serving: a multiple of 16 from 128 through 2048; unset keeps the chip/family default |
+ | `TF_ANE_COLUMNS` | Whole u32 count; zero disables the experimental share; default zero |
+ | `TF_METAL4` | Metal: exactly `0` or `1`; `1` sends a family's GPU work through Metal 4 (macOS 26 and later) where the family supports it: the same kernels in the same order, with Metal 4's command queue, allocators, argument tables and barriers, and bit-identical outputs; `0` keeps Metal 3. DeepSeek-V4.1 defaults to `1` where the Mac has Metal 4 (its device test rigs to `0`); Macs without it stay on Metal 3 |
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 4c58c0841..857534eb1 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -24,18 +24,18 @@ const gb10_shared_costs = [_]lanes.config.Cost{
+     .{ .width = 8, .ms = 81.4 },   .{ .width = 16, .ms = 120.6 }, .{ .width = 32, .ms = 182.3 },
+     .{ .width = 64, .ms = 223.4 },
+ };
+-/// Mini's (pack A, 4.05 bpw) lone windows and shared forwards, timed the same way with the serve's NVFP4 drafter.
++/// Mini's (pack A, 4.05 bpw) lone windows and shared forwards with the one-launch conv save, NVFP4 drafter.
+ const mini_window_costs = [_]lanes.config.Cost{
+-    .{ .width = 1, .ms = 17.1 }, .{ .width = 2, .ms = 20.7 }, .{ .width = 3, .ms = 23.1 }, .{ .width = 4, .ms = 25.5 },
+-    .{ .width = 5, .ms = 27.3 }, .{ .width = 6, .ms = 29.0 }, .{ .width = 7, .ms = 31.0 }, .{ .width = 8, .ms = 32.2 },
++    .{ .width = 1, .ms = 17.0 }, .{ .width = 2, .ms = 20.0 }, .{ .width = 3, .ms = 22.5 }, .{ .width = 4, .ms = 25.0 },
++    .{ .width = 5, .ms = 26.9 }, .{ .width = 6, .ms = 28.9 }, .{ .width = 7, .ms = 30.4 }, .{ .width = 8, .ms = 31.5 },
+ };
+ const mini_shared_costs = [_]lanes.config.Cost{
+-    .{ .width = 1, .ms = 17.1 },  .{ .width = 2, .ms = 20.5 },  .{ .width = 4, .ms = 27.8 },  .{ .width = 8, .ms = 35.4 },
+-    .{ .width = 16, .ms = 47.0 }, .{ .width = 32, .ms = 66.1 }, .{ .width = 64, .ms = 87.5 },
++    .{ .width = 1, .ms = 17.0 },  .{ .width = 2, .ms = 20.5 },  .{ .width = 4, .ms = 27.7 },  .{ .width = 8, .ms = 34.2 },
++    .{ .width = 16, .ms = 44.5 }, .{ .width = 32, .ms = 63.1 }, .{ .width = 64, .ms = 81.7 },
+ };
+ /// Mini's batched draft pass (NVFP4): one stream's block, and each further stream's share of one pass.
+-const mini_pass_ms = 7.4;
+-const mini_stream_ms = 0.7;
++const mini_pass_ms = 7.1;
++const mini_stream_ms = 0.8;
+ 
+ /// TF_INKLING2_PLAIN_STREAMS, else Small 2 (its per-stream pass lost 5-10 % at 4-8 streams), Mini 4 (verify cost).
+ pub fn plainStreams(mini: bool) !u32 {
+@@ -44,6 +44,13 @@ pub fn plainStreams(mini: bool) !u32 {
+     return @intCast(try env.read(u64, "TF_INKLING2_PLAIN_STREAMS", if (mini) 4 else 2));
+ }
+ 
++/// TF_INKLING2_FIXED_BLOCK: Mini's shared rounds price the draft pass as one block a round (default 1; 0: per step).
++pub fn fixedBlock() !bool {
++    const env = @import("sys").environment;
++    comptime env.registered("TF_INKLING2_FIXED_BLOCK");
++    return try env.read(u64, "TF_INKLING2_FIXED_BLOCK", 1) == 1;
++}
++
+ /// A stream's place in the backend: its slot, the rows its last window left uncommitted, its first token.
+ const Lane = struct {
+     slot: u32,
+@@ -65,6 +72,7 @@ pub const Lanes = struct {
+     next: u64 = 0,
+     shared: u64 = 0, // forwards that held several streams' windows
+     plain_streams: u32 = 2, // shared rounds this wide draft none (plainStreams; 0: every width drafts)
++    fixed_block: bool = false, // Mini: the shared allocator prices the pass as one block (fixedBlock)
+ 
+     pub fn deinit(self: *Lanes) void {
+         self.lanes.deinit(self.x.e.gpa);
+@@ -94,6 +102,7 @@ pub const Lanes = struct {
+         const head = self.x.e.drafter != null;
+         const mini = self.x.e.c.loop != null;
+         return .{
++            .fixed_draft_block = head and mini and self.fixed_block, // Mini's pass costs about the same at any depth
+             .copy_drafts = false,
+             .exact_width = max_rows,
+             .gpu_tokens = false,
+diff --git a/zig/src/families/inkling2/native.zig b/zig/src/families/inkling2/native.zig
+index 2da5a6ffd..b21e55e91 100644
+--- a/zig/src/families/inkling2/native.zig
++++ b/zig/src/families/inkling2/native.zig
+@@ -175,7 +175,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         std.process.exit(0);
+     }
+     own.link.?.asleep = cuda.tp_watch.open();
+-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link.? }, .plain_streams = try ink_lanes.plainStreams(own.e.c.loop != null) };
++    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link.? }, .plain_streams = try ink_lanes.plainStreams(own.e.c.loop != null), .fixed_block = try ink_lanes.fixedBlock() };
+     if (lim) |l| own.offer = try pictures.Offer.init(gpa, io, l);
+     return .{
+         .backend = own.lanes.backend(),
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 3e13dcba7..7a3fdea16 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -284,6 +284,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_PROFILE", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (unset or blank is off)" },
+     .{ .name = "TF_INKLING2_PLAIN_STREAMS", .scope = .inkling2, .kind = .size, .max = 16, .forms = "a whole stream count from 0 to 16 (0: every width drafts; unset: the family's default)" },
+     .{ .name = "TF_INKLING2_DRAFT_BATCH", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (0 puts Mini's draft pass back on the per-stream absorbs and launches; default 1)" },
++    .{ .name = "TF_INKLING2_FIXED_BLOCK", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (0 prices Mini's shared draft pass per head step; default 1, one block a round)" },
+     .{ .name = "TF_INKLING2_CONV_SAVE", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (0 backs up conv states before a several-row window one copy a site; default 1)" },
+ };
+ 
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 1cf6bb955..3aced465c 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -215,6 +215,7 @@ const valid = [_]Case{
+     .{ .name = "TF_INKLING2_PLAIN_STREAMS", .raw = "2", .n = 2 },
+     .{ .name = "TF_INKLING2_DRAFT_BATCH", .raw = "0", .n = 0 },
+     .{ .name = "TF_INKLING2_CONV_SAVE", .raw = "0", .n = 0 },
++    .{ .name = "TF_INKLING2_FIXED_BLOCK", .raw = "0", .n = 0 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
+-- 
+2.53.0
+

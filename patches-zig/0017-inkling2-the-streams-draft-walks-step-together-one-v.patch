@@ -1,7 +1,7 @@
 From 2377f2444b993de8e2e5f0de62d53b56d7f13673 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 19:46:16 +1100
-Subject: [PATCH 17/24] inkling2: the streams' draft walks step together: one
+Subject: [PATCH 17/29] inkling2: the streams' draft walks step together: one
  vocabulary launch and one pick gather a step
 
 ---

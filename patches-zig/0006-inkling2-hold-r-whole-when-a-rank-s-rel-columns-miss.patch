@@ -1,7 +1,7 @@
 From a5d4f3b8295741864d96b6922957ec56bdc5b45a Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 13:41:19 +1100
-Subject: [PATCH 06/24] inkling2: hold r whole when a rank's rel columns miss
+Subject: [PATCH 06/29] inkling2: hold r whole when a rank's rel columns miss
  the 128-wide blocks
 
 Mini has 24 query heads, so at two ranks each holds 12 x 16 = 192 rel

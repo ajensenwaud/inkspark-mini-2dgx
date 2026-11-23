@@ -1,7 +1,7 @@
 From c872ee252108eee1b3f3ce9bf3f599a6f0f7f8a5 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 16:43:10 +1100
-Subject: [PATCH 12/24] inkling2: compile records for Mini's loop kernels
+Subject: [PATCH 12/29] inkling2: compile records for Mini's loop kernels
 
 The ten launches of the inkling2_loop image (loop.cu: message, the three
 gate down projections, blend, mix, norm, bank, and the prompt GEMM's

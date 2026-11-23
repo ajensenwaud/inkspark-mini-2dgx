@@ -1,7 +1,7 @@
 From 9219e8f2edf00d77efd2f4621bc0e6602afff1dc Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 19:18:13 +1100
-Subject: [PATCH 13/24] inkling2: a visit's q, gate, r, k and v in one rotation
+Subject: [PATCH 13/29] inkling2: a visit's q, gate, r, k and v in one rotation
  launch and one linear launch
 
 ---

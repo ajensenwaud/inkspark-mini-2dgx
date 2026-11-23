@@ -1,7 +1,7 @@
 From 6070b98a1187dde23ad0cc40efbff099470cc6b3 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 04:39:30 +1100
-Subject: [PATCH 23/24] inkling2: the batched draft pass under the kernel
+Subject: [PATCH 23/29] inkling2: the batched draft pass under the kernel
  contract
 
 Each of the six new launches runs the reference and the planted control of

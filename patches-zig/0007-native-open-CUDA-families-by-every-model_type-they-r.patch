@@ -1,7 +1,7 @@
 From 0150a491594b453d2387c8ba9e9f7884d79c4682 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 13:57:24 +1100
-Subject: [PATCH 07/24] native: open CUDA families by every model_type they
+Subject: [PATCH 07/29] native: open CUDA families by every model_type they
  read
 
 A family's also_model_types (cuda_alias.zig) only reached the HIP host,

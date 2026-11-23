@@ -1,7 +1,7 @@
 From f8bfec2c19c70658d11005e7e35c507bdc09ba26 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 19:18:20 +1100
-Subject: [PATCH 14/24] inkling2: every stream's draft block in one pass, so
+Subject: [PATCH 14/29] inkling2: every stream's draft block in one pass, so
  shared rounds can draft (TF_INKLING2_PLAIN_STREAMS)
 
 ---

@@ -1,7 +1,7 @@
 From 6f995239522e71ee8f3c20f799ffd42611062c80 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 19:18:20 +1100
-Subject: [PATCH 15/24] inkling2: sampled draws with no cut race on each rank's
+Subject: [PATCH 15/29] inkling2: sampled draws with no cut race on each rank's
  columns instead of broadcasting whole rows
 
 ---

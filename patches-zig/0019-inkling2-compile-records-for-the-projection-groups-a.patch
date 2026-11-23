@@ -1,7 +1,7 @@
 From b3af5bbf08dc13b64f610d32b2a4dc46d1f22536 Mon Sep 17 00:00:00 2001
 From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 21:41:15 +1100
-Subject: [PATCH 19/24] inkling2: compile records for the projection groups and
+Subject: [PATCH 19/29] inkling2: compile records for the projection groups and
  the batched draft walk
 
 tf_exl3_group5_{8,10,12}_2_{4,8}, tf_exl3_rot_group5, tf_ink2_dsp_vocab_rows and tf_ink2_dsp_pick_rows: nvcc 13.0 records on sm_80/86/89/120/121 with later_pending set, 13.3 receipts in measurements/pending_133.zig, 13.2 pending.
