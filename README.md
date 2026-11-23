@@ -55,11 +55,10 @@ Settings: fp8 KV, temperature 1.0, reasoning high, 64K tokens / reply:
 
 | Streams | Greedy | Thinking Machines' sampling (temperature 1.0) |
 |---|---|---|
-| 1 (chat / code / agent / report) | 77 / 89 / 70 / 69 tok/s | 68 / 94 / 79 / 66 tok/s |
-| 2 | 116 tok/s in total | 108 tok/s in total |
-| 3 | 137 tok/s in total | 137 tok/s in total |
-| 4 | 153 tok/s in total | 156 tok/s in total |
-| 8 (`SHAPE=agents`) | 232 tok/s in total | 233 tok/s in total |
+| 1 (chat / code / agent / report) | 73 / 95 / 78 / 71 tok/s | 70 / 83 / 80 / 68 tok/s |
+| 2 | 111 tok/s in total | 113 tok/s in total |
+| 4 | 159 tok/s in total | 160 tok/s in total |
+| 8 (`SHAPE=agents`) | 242 tok/s in total | 238 tok/s in total |
 
 
 Long prompts, one stream, greedy:
