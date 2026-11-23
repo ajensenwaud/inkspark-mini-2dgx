@@ -1,0 +1,52 @@
+# InkSpark-Mini engine image: builds TensorFold's Zig engine for GB10 (sm_121) and runs it. The base is Mia's GLM-5.3
+# TensorFold image, pinned by digest (NVIDIA PyTorch 26.07: CUDA 13.3, nvcc 13.3.73, NCCL 2.30.7, libibverbs). This
+# file adds Zig 0.17.0, the version TensorFold v1.3.3 pins in .zig-version, and the JPEG and WebP decoders the server
+# loads for pictures, at the exact releases it accepts. Every download is checked against a pinned sha256 inside the
+# build. Nothing is installed on the hosts.
+#   docker build -t inkspark-zig:0.17.0 --build-arg BASE_IMAGE=<scripts/config.sh BASE_IMAGE> -f docker/Dockerfile.build docker
+ARG BASE_IMAGE
+
+# libjpeg-turbo and libwebp, built from their release tarballs with the base's own cmake and gcc. Only the two shared
+# libraries and their licences leave this stage. The server refuses any other release, since its pixels can differ.
+FROM ${BASE_IMAGE} AS codecs
+ARG JPEG_TURBO_VERSION=3.1.4.1
+ARG JPEG_TURBO_SHA256=ecae8008e2cc9ade2f2c1bb9d5e6d4fb73e7c433866a056bd82980741571a022
+ARG WEBP_VERSION=1.6.0
+ARG WEBP_SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
+WORKDIR /src
+RUN curl -fsSL -o jpeg.tar.gz "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${JPEG_TURBO_VERSION}/libjpeg-turbo-${JPEG_TURBO_VERSION}.tar.gz" \
+ && curl -fsSL -o webp.tar.gz "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${WEBP_VERSION}.tar.gz" \
+ && printf '%s  jpeg.tar.gz\n%s  webp.tar.gz\n' "${JPEG_TURBO_SHA256}" "${WEBP_SHA256}" | sha256sum -c - \
+ && tar -xzf jpeg.tar.gz && tar -xzf webp.tar.gz \
+ && cmake -S "libjpeg-turbo-${JPEG_TURBO_VERSION}" -B jpeg -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/codecs \
+      -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_STATIC=OFF -DWITH_TOOLS=OFF -DWITH_TESTS=OFF \
+ && cmake --build jpeg -j"$(nproc)" && cmake --install jpeg \
+ && cmake -S "libwebp-${WEBP_VERSION}" -B webp -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/codecs \
+      -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=ON -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF \
+      -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF \
+      -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_LIBWEBPMUX=OFF -DWEBP_BUILD_WEBPMUX=OFF -DWEBP_BUILD_EXTRAS=OFF \
+ && cmake --build webp -j"$(nproc)" && cmake --install webp \
+ && mkdir -p /out/lib /out/share/doc/libjpeg-turbo /out/share/doc/libwebp \
+ && cp -a /opt/codecs/lib/libturbojpeg.so.* /opt/codecs/lib/libwebpdecoder.so.* /out/lib/ \
+ && cp "libjpeg-turbo-${JPEG_TURBO_VERSION}/LICENSE.md" "libjpeg-turbo-${JPEG_TURBO_VERSION}/README.ijg" /out/share/doc/libjpeg-turbo/ \
+ && cp "libwebp-${WEBP_VERSION}/COPYING" "libwebp-${WEBP_VERSION}/PATENTS" /out/share/doc/libwebp/ \
+ && grep -aq "libjpeg-turbo version ${JPEG_TURBO_VERSION} " /out/lib/libturbojpeg.so.0 \
+ && test -e /out/lib/libwebpdecoder.so.3
+
+FROM ${BASE_IMAGE}
+ARG ZIG_VERSION=0.17.0
+ARG ZIG_SHA256=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
+RUN curl -fsSL https://ziglang.org/download/index.json \
+      | jq -e --arg v "${ZIG_VERSION}" --arg s "${ZIG_SHA256}" '.[$v]["aarch64-linux"].shasum == $s' >/dev/null \
+ && curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
+ && echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - \
+ && mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
+ && rm /tmp/zig.tar.xz && /opt/zig/zig version
+# The server looks for libturbojpeg.so.0 and libwebpdecoder.so.3 in lib/ beside its bin/, then on the loader's path.
+# The build in zig-out/ is mounted from the host at run time, so the image puts both on the loader's path.
+COPY --from=codecs /out/ /usr/local/
+RUN ldconfig && ldconfig -p | grep -E 'libturbojpeg\.so\.0 |libwebpdecoder\.so\.3 '
+ENV PATH=/opt/zig:${PATH} \
+    ZIG_GLOBAL_CACHE_DIR=/work/.zig-cache-global
+WORKDIR /work
+ENTRYPOINT []

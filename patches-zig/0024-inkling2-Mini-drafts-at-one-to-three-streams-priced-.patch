@@ -1,0 +1,55 @@
+From 08b3e5774d418e3fe0a90c6a36ac3485c72de702 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:39:32 +1100
+Subject: [PATCH 24/24] inkling2: Mini drafts at one to three streams, priced
+ from the batched pass
+
+The batched pass costs 7.4 ms for one stream and about 0.7 ms for each
+further one. From four streams on, each extra verify row costs more
+than its drafts give back, so Mini's rounds run plain there by default.
+---
+ docs/environment.md                 |  2 +-
+ zig/src/families/inkling2/lanes.zig | 10 +++++-----
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index f7a8d0b7b..ac4df3c1a 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -81,7 +81,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TF_INKLING2_KV` | Inkling 2 on CUDA: `fp8` stores the global layers' keys and values as e4m3 with an fp32 scale a token and key head (about half the bytes of a stream); `bf16` (default) keeps them in bf16. Sliding layers stay bf16 |
+ | `TF_INKLING2_DRAFT_WEIGHTS` | Inkling 2 on CUDA: `nvfp4` quantises the bundled drafter's projections to NVFP4 at load (round to nearest); `bf16` (default) keeps them as released. Changes acceptance, never output |
+ | `TF_INKLING2_PROFILE` | Inkling 2 on CUDA: `1` times a round's phases on each rank and logs a line every 200 rounds (syncs the forward; off by default) |
+-| `TF_INKLING2_PLAIN_STREAMS` | Inkling 2 on CUDA: shared decode rounds of this many streams or more draft nothing; `0` lets every width draft. Unset: 2 on Small (from two streams on, rounds run plain), 0 on Mini (its batched pass drafts at every width; the depth rule still gives a stream no drafts when they do not pay). Changes speed, never output |
++| `TF_INKLING2_PLAIN_STREAMS` | Inkling 2 on CUDA: shared decode rounds of this many streams or more draft nothing; `0` lets every width draft. Unset: 2 on Small (from two streams on, rounds run plain), 4 on Mini (its batched pass drafts at one to three streams; from four on, each verify row costs more than the drafts give back). Changes speed, never output |
+ | `TF_INKLING2_DRAFT_BATCH` | Inkling 2 Mini on CUDA: `0` runs the draft pass's absorbs, attention and walk launches one stream at a time, as before the batched pass; unset or `1` puts every stream through each launch once. Small always keeps its released pass. Changes speed, never output or drafts |
+ | `TF_PROMPT_ROWS` | Native serving: a multiple of 16 from 128 through 2048; unset keeps the chip/family default |
+ | `TF_ANE_COLUMNS` | Whole u32 count; zero disables the experimental share; default zero |
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 505fc8aed..4c58c0841 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -33,15 +33,15 @@ const mini_shared_costs = [_]lanes.config.Cost{
+     .{ .width = 1, .ms = 17.1 },  .{ .width = 2, .ms = 20.5 },  .{ .width = 4, .ms = 27.8 },  .{ .width = 8, .ms = 35.4 },
+     .{ .width = 16, .ms = 47.0 }, .{ .width = 32, .ms = 66.1 }, .{ .width = 64, .ms = 87.5 },
+ };
+-/// Mini's draft pass (NVFP4): one stream's block, and each further stream's share of one pass.
+-const mini_pass_ms = 7.0;
+-const mini_stream_ms = 4.0;
++/// Mini's batched draft pass (NVFP4): one stream's block, and each further stream's share of one pass.
++const mini_pass_ms = 7.4;
++const mini_stream_ms = 0.7;
+ 
+-/// TF_INKLING2_PLAIN_STREAMS, else Small 2 (its per-stream pass lost 5-10 % at 4-8 streams), Mini 0 (batched pass).
++/// TF_INKLING2_PLAIN_STREAMS, else Small 2 (its per-stream pass lost 5-10 % at 4-8 streams), Mini 4 (verify cost).
+ pub fn plainStreams(mini: bool) !u32 {
+     const env = @import("sys").environment;
+     comptime env.registered("TF_INKLING2_PLAIN_STREAMS");
+-    return @intCast(try env.read(u64, "TF_INKLING2_PLAIN_STREAMS", if (mini) 0 else 2));
++    return @intCast(try env.read(u64, "TF_INKLING2_PLAIN_STREAMS", if (mini) 4 else 2));
+ }
+ 
+ /// A stream's place in the backend: its slot, the rows its last window left uncommitted, its first token.
+-- 
+2.53.0
+

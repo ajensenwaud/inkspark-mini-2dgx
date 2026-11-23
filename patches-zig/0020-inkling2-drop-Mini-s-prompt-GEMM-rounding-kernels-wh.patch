@@ -1,0 +1,216 @@
+From 63c47dcb56f03a2b7f04eccb963211566752cd20 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:22:53 +1100
+Subject: [PATCH 20/24] inkling2: drop Mini's prompt GEMM rounding kernels,
+ which no path runs now
+
+Since Mini's prompt rows keep the decode kernels, tf_ink2_loop_rotate and
+tf_ink2_loop_tail serve nothing: the prompt GEMM is Small's alone and runs
+its released rounding. The two kernels, their records and the Rounding
+choice go; prompt_dense takes Small's epilogue again.
+---
+ zig/kernels/cuda/inkling2/loop.cu             | 31 -------------------
+ .../core/contract/inkling2_loop_records.zig   |  4 +--
+ .../contract/measurements/pending_133.zig     |  2 --
+ zig/src/families/inkling2/dump_main.zig       |  2 +-
+ zig/src/families/inkling2/engine.zig          |  2 +-
+ zig/src/families/inkling2/forward.zig         |  5 ---
+ zig/src/families/inkling2/loop.zig            |  4 ---
+ zig/src/families/inkling2/prompt_dense.zig    | 13 +++-----
+ 8 files changed, 8 insertions(+), 55 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/loop.cu b/zig/kernels/cuda/inkling2/loop.cu
+index 7089ac9b5..01307ee73 100644
+--- a/zig/kernels/cuda/inkling2/loop.cu
++++ b/zig/kernels/cuda/inkling2/loop.cu
+@@ -7,9 +7,6 @@
+ #include "common/qmm_frag.cuh"
+ #include "common/reduce.cuh"
+ #include "common/vec.cuh"
+-#include "exl3_candidate.cuh"
+-
+-constexpr float kHad = 0.08838834764831845f;  // 1/sqrt(128), the decode kernels' HAD_SCALE
+ 
+ namespace ink2_loop {
+ 
+@@ -386,31 +383,3 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2_loop_bank(const uint16
+     const size_t row = blockIdx.x;
+     for (int c = threadIdx.x; c < C; c += blockDim.x) bank[(row * sources + s) * C + c] = bf(x[row * C + c]);
+ }
+-
+-// Mini's prompt GEMM input: tf_exl3_rotate_h's transform rounded to fp16 at the decode kernels' 1/sqrt(128).
+-extern "C" __global__ void __launch_bounds__(32) tf_ink2_loop_rotate(const __nv_bfloat16* X, unsigned x_stride,
+-                                                                     const __half* suh, __half* R, unsigned r_stride) {
+-    const unsigned lane = threadIdx.x, row = blockIdx.y, base = blockIdx.x * 128;
+-    float v[4];
+-    for (int q = 0; q < 4; ++q) {
+-        const unsigned c = base + lane + 32 * q;
+-        v[q] = __fmul_rn(__bfloat162float(X[(uint64_t)row * x_stride + c]), __half2float(suh[c]));
+-    }
+-    tf_exl3_fwht(v, lane);
+-    for (int q = 0; q < 4; ++q)
+-        R[(uint64_t)row * r_stride + base + lane + 32 * q] = __float2half_rn(__fmul_rn(v[q], kHad));
+-}
+-
+-// Mini's prompt GEMM epilogue: tf_ink2_prompt_tail with the other 1/sqrt(128) in place of 2^-3.
+-extern "C" __global__ void __launch_bounds__(32) tf_ink2_loop_tail(const float* __restrict__ z, const __half* svh,
+-                                                                   unsigned n, uint8_t* y, unsigned y_f32) {
+-    const unsigned lane = threadIdx.x, row = blockIdx.y, ob = blockIdx.x;
+-    float v[4];
+-    for (int q = 0; q < 4; ++q) v[q] = z[static_cast<uint64_t>(row) * n + ob * 128 + lane + 32 * q];
+-    tf_exl3_fwht(v, lane);
+-    for (int q = 0; q < 4; ++q) {
+-        const unsigned c = ob * 128 + lane + 32 * q;
+-        const float t = __fmul_rn(v[q], __fmul_rn(__half2float(svh[c]), kHad));
+-        tf_exl3_store(y, static_cast<uint64_t>(row) * n + c, t, y_f32);
+-    }
+-}
+diff --git a/zig/src/core/contract/inkling2_loop_records.zig b/zig/src/core/contract/inkling2_loop_records.zig
+index 0da7f3515..e9a67fd16 100644
+--- a/zig/src/core/contract/inkling2_loop_records.zig
++++ b/zig/src/core/contract/inkling2_loop_records.zig
+@@ -11,10 +11,8 @@ pub const cuda = [_]registry.CudaRecord{
+     .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_mix", .symbol = "tf_ink2_loop_mix", .image = "inkling2_loop", .threads = 512, .min_sm = 80 }, .usage = .{ .{ .regs = 32, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 } }, .later_pending = true },
+     .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_norm", .symbol = "tf_ink2_loop_norm", .image = "inkling2_loop", .threads = 512, .min_sm = 80 }, .usage = .{ .{ .regs = 17, .static = 128, .bound = 512 }, .{ .regs = 18, .static = 128, .bound = 512 }, .{ .regs = 18, .static = 128, .bound = 512 }, .{ .regs = 22, .static = 128, .bound = 512 }, .{ .regs = 22, .static = 128, .bound = 512 } }, .later_pending = true },
+     .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_bank", .symbol = "tf_ink2_loop_bank", .image = "inkling2_loop", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 } }, .later_pending = true },
+-    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_rotate", .symbol = "tf_ink2_loop_rotate", .image = "inkling2_loop", .threads = 32, .min_sm = 80 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 28, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 } }, .later_pending = true },
+-    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_tail", .symbol = "tf_ink2_loop_tail", .image = "inkling2_loop", .threads = 32, .min_sm = 80 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 30, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 24, .static = 0, .bound = 32 }, .{ .regs = 24, .static = 0, .bound = 32 } }, .later_pending = true },
+ };
+ /// nvcc 13.2's: pending (no 13.2 compiler measured).
+ pub const cuda_132 = [_]registry.Override{};
+-/// nvcc 13.3's: none here, as later_pending reads 13.3 from measurements/pending_133.zig (all ten launches).
++/// nvcc 13.3's: none here, as later_pending reads 13.3 from measurements/pending_133.zig (all eight launches).
+ pub const cuda_133 = [_]registry.Override{};
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index 268ba3bad..9fb66ce55 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -83,8 +83,6 @@ pub const records = [_]Override{
+     .{ .name = "inkling2 loop tf_ink2_loop_mix", .usage = .{ .{ .regs = 32, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 } } },
+     .{ .name = "inkling2 loop tf_ink2_loop_norm", .usage = .{ .{ .regs = 17, .static = 128, .bound = 512 }, .{ .regs = 18, .static = 128, .bound = 512 }, .{ .regs = 18, .static = 128, .bound = 512 }, .{ .regs = 20, .static = 128, .bound = 512 }, .{ .regs = 20, .static = 128, .bound = 512 } } },
+     .{ .name = "inkling2 loop tf_ink2_loop_bank", .usage = .{ .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 } } },
+-    .{ .name = "inkling2 loop tf_ink2_loop_rotate", .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 28, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 } } },
+-    .{ .name = "inkling2 loop tf_ink2_loop_tail", .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 30, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 23, .static = 0, .bound = 32 }, .{ .regs = 23, .static = 0, .bound = 32 } } },
+     .{ .name = "exl3_linear tf_exl3_group5_8_2_4", .usage = .{ .{ .regs = 195, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 166, .static = 128, .bound = 128 }, .{ .regs = 166, .static = 128, .bound = 128 } } },
+     .{ .name = "exl3_linear tf_exl3_group5_8_2_8", .usage = .{ .{ .regs = 160, .static = 128, .bound = 256 }, .{ .regs = 162, .static = 128, .bound = 256 }, .{ .regs = 162, .static = 128, .bound = 256 }, .{ .regs = 128, .static = 128, .bound = 256 }, .{ .regs = 128, .static = 128, .bound = 256 } } },
+     .{ .name = "exl3_linear tf_exl3_group5_10_2_4", .usage = .{ .{ .regs = 194, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 164, .static = 128, .bound = 128 }, .{ .regs = 164, .static = 128, .bound = 128 } } },
+diff --git a/zig/src/families/inkling2/dump_main.zig b/zig/src/families/inkling2/dump_main.zig
+index 07e452702..16f4d0049 100644
+--- a/zig/src/families/inkling2/dump_main.zig
++++ b/zig/src/families/inkling2/dump_main.zig
+@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !u8 {
+     var st = try ink.forward.State.init(gpa, &driver, &w.config, shape, texts.len);
+     defer st.deinit();
+     // prompt rows' projections by the GEMM, as the engine runs them (without cuBLASLt: the decode kernels)
+-    m.prompt = if (!ink.prompt_dense.usedBy(&c)) null else ink.prompt_dense.Prompt.of(gpa, &driver, m.rounding(&c), shape.rows, w.layers) catch null;
++    m.prompt = if (!ink.prompt_dense.usedBy(&c)) null else ink.prompt_dense.Prompt.of(gpa, &driver, m.ops.prompt_tail, shape.rows, w.layers) catch null;
+     var f: ink.forward.Forward = .{ .d = &driver, .m = &m, .w = &w, .b = &b, .shape = shape, .stream = stream, .zero_messages = zero };
+     if (lib) |*l| f.exchange = .{ .nccl = .{ .lib = l, .comm = comm } };
+     try std.Io.Dir.cwd().createDirPath(io, args[3]);
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 81d129d69..fe29dc02f 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -112,7 +112,7 @@ pub const Engine = struct {
+         for (e.w.layers) |l| for ([_]cuda.exl3.Weight{ l.attn.q, l.attn.k, l.attn.v, l.attn.r, l.attn.gate, l.attn.o }) |x| try e.m.dense.reserve(stream, x);
+         try e.m.dense.reserve(stream, e.w.head); // scratch grown now, so nothing allocates inside a graph capture
+         const pd = @import("prompt_dense.zig");
+-        e.m.prompt = if (!pd.usedBy(&e.c)) null else pd.Prompt.of(gpa, d, e.m.rounding(&e.c), prompt_rows, e.w.layers) catch |err| blk: { // without cuBLASLt, prompt rows keep the decode kernels
++        e.m.prompt = if (!pd.usedBy(&e.c)) null else pd.Prompt.of(gpa, d, e.m.ops.prompt_tail, prompt_rows, e.w.layers) catch |err| blk: { // without cuBLASLt, prompt rows keep the decode kernels
+             std.log.warn("inkling2: prompt projections on the decode kernels ({s})", .{@errorName(err)});
+             break :blk null;
+         };
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 485be3d0e..0d1247ecf 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -51,11 +51,6 @@ pub const Modules = struct {
+         m.experts.unload();
+         m.dense.unload();
+     }
+-
+-    /// The prompt GEMM's rounding for `c`: Mini's (loop_config, model_type inkling2_loop) or Small's as released.
+-    pub fn rounding(m: *const Modules, c: *const cfg.Config) prompt_dense.Rounding {
+-        return if (c.loop != null) .{ .rotate = m.loop.rotate, .tail = m.loop.tail } else .{ .tail = m.ops.prompt_tail };
+-    }
+ };
+ 
+ /// A layer's narrow projections (r, k, v, row dots) run here beside q and the gate, on their own EXL3 scratch.
+diff --git a/zig/src/families/inkling2/loop.zig b/zig/src/families/inkling2/loop.zig
+index 969003780..ba76cab78 100644
+--- a/zig/src/families/inkling2/loop.zig
++++ b/zig/src/families/inkling2/loop.zig
+@@ -46,8 +46,6 @@ pub const Kernels = struct {
+     mix: cuda.Function,
+     norm: cuda.Function,
+     bank: cuda.Function,
+-    rotate: cuda.Function, // Mini's prompt GEMM input rounding (prompt_dense.Rounding)
+-    tail: cuda.Function, // and its epilogue
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -63,8 +61,6 @@ pub const Kernels = struct {
+             .mix = try mod.function("tf_ink2_loop_mix"),
+             .norm = try mod.function("tf_ink2_loop_norm"),
+             .bank = try mod.function("tf_ink2_loop_bank"),
+-            .rotate = try mod.function("tf_ink2_loop_rotate"),
+-            .tail = try mod.function("tf_ink2_loop_tail"),
+         };
+     }
+ 
+diff --git a/zig/src/families/inkling2/prompt_dense.zig b/zig/src/families/inkling2/prompt_dense.zig
+index 7a9e5fc1f..88c0f854c 100644
+--- a/zig/src/families/inkling2/prompt_dense.zig
++++ b/zig/src/families/inkling2/prompt_dense.zig
+@@ -16,9 +16,6 @@ const workspace_bytes = 32 << 20;
+ 
+ const Plan = struct { rows: usize, k: usize, n: usize, g: lt_.Gemm };
+ 
+-/// The GEMM's input rounding and epilogue: tf_exl3_rotate_h's 2^-4 and 2^-3, or loop.cu's pair at 1/sqrt(128) each.
+-pub const Rounding = struct { rotate: ?cuda.Function = null, tail: cuda.Function };
+-
+ pub const Prompt = struct {
+     gpa: std.mem.Allocator,
+     d: *const cuda.Driver,
+@@ -28,14 +25,14 @@ pub const Prompt = struct {
+     rotate: cuda.Function,
+     unpack: cuda.Function,
+     tail: cuda.Function,
+-    xh: Buf, // fp16 [rows][k]: (x * suh) H at the rounding's scale
++    xh: Buf, // fp16 [rows][k]: (x * suh) H 2^-4
+     w: Buf, // fp16 [k][n]: W_q in the rotated domain
+     z: Buf, // fp32 [rows][n]: the GEMM's sums
+     ws: Buf,
+     plans: std.ArrayList(Plan) = .empty,
+     rows_max: usize,
+ 
+-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, r: Rounding, rows_max: usize, k_max: usize, n_max: usize) !Prompt {
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, tail: cuda.Function, rows_max: usize, k_max: usize, n_max: usize) !Prompt {
+         var lt = try lt_.Library.open();
+         errdefer lt.close();
+         const handle = try lt_.createHandle(&lt);
+@@ -49,18 +46,18 @@ pub const Prompt = struct {
+         var z = try Buf.alloc(d, rows_max * n_max * 4);
+         errdefer z.free();
+         const ws = try Buf.alloc(d, workspace_bytes);
+-        return .{ .gpa = gpa, .d = d, .lt = lt, .handle = handle, .mod = mod, .rotate = r.rotate orelse try mod.function("tf_exl3_rotate_h"), .unpack = try mod.function("tf_exl3_unpack"), .tail = r.tail, .xh = xh, .w = w, .z = z, .ws = ws, .rows_max = rows_max };
++        return .{ .gpa = gpa, .d = d, .lt = lt, .handle = handle, .mod = mod, .rotate = try mod.function("tf_exl3_rotate_h"), .unpack = try mod.function("tf_exl3_unpack"), .tail = tail, .xh = xh, .w = w, .z = z, .ws = ws, .rows_max = rows_max };
+     }
+ 
+     /// Scratch for the widest attention projection of `layers` at `rows` rows.
+-    pub fn of(gpa: std.mem.Allocator, d: *const cuda.Driver, r: Rounding, rows: usize, layers: anytype) !Prompt {
++    pub fn of(gpa: std.mem.Allocator, d: *const cuda.Driver, tail: cuda.Function, rows: usize, layers: anytype) !Prompt {
+         var k: usize = 0;
+         var n: usize = 0;
+         for (layers) |l| for ([_]cuda.exl3.Weight{ l.attn.q, l.attn.k, l.attn.v, l.attn.r, l.attn.gate, l.attn.o }) |x| {
+             k = @max(k, x.k);
+             n = @max(n, x.n);
+         };
+-        return init(gpa, d, r, rows, k, n);
++        return init(gpa, d, tail, rows, k, n);
+     }
+ 
+     pub fn deinit(p: *Prompt) void {
+-- 
+2.53.0
+

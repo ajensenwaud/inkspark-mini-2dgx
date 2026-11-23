@@ -1,0 +1,3 @@
+# Copy to scripts/local.sh (gitignored) and fill in your two Sparks.
+WORKER=user@192.0.2.2      # rank 1: user@address on the CX7 link between the Sparks
+MASTER=192.0.2.1           # rank 0 (this head): its address on that link

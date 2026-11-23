@@ -1,0 +1,58 @@
+From e571cc3838706c62cec1aa2a976c83ce09fae170 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:46:15 +1100
+Subject: [PATCH 16/24] inkling2: Mini's prompt rows keep the decode kernels,
+ so a prompt pass gives decode rows' bits at two ranks
+
+---
+ zig/src/families/inkling2/dump_main.zig    | 2 +-
+ zig/src/families/inkling2/engine.zig       | 3 ++-
+ zig/src/families/inkling2/prompt_dense.zig | 5 +++++
+ 3 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/inkling2/dump_main.zig b/zig/src/families/inkling2/dump_main.zig
+index fcf013876..07e452702 100644
+--- a/zig/src/families/inkling2/dump_main.zig
++++ b/zig/src/families/inkling2/dump_main.zig
+@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !u8 {
+     var st = try ink.forward.State.init(gpa, &driver, &w.config, shape, texts.len);
+     defer st.deinit();
+     // prompt rows' projections by the GEMM, as the engine runs them (without cuBLASLt: the decode kernels)
+-    m.prompt = ink.prompt_dense.Prompt.of(gpa, &driver, m.rounding(&c), shape.rows, w.layers) catch null;
++    m.prompt = if (!ink.prompt_dense.usedBy(&c)) null else ink.prompt_dense.Prompt.of(gpa, &driver, m.rounding(&c), shape.rows, w.layers) catch null;
+     var f: ink.forward.Forward = .{ .d = &driver, .m = &m, .w = &w, .b = &b, .shape = shape, .stream = stream, .zero_messages = zero };
+     if (lib) |*l| f.exchange = .{ .nccl = .{ .lib = l, .comm = comm } };
+     try std.Io.Dir.cwd().createDirPath(io, args[3]);
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 13365fe3f..81d129d69 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -111,7 +111,8 @@ pub const Engine = struct {
+         errdefer e.bd.deinit();
+         for (e.w.layers) |l| for ([_]cuda.exl3.Weight{ l.attn.q, l.attn.k, l.attn.v, l.attn.r, l.attn.gate, l.attn.o }) |x| try e.m.dense.reserve(stream, x);
+         try e.m.dense.reserve(stream, e.w.head); // scratch grown now, so nothing allocates inside a graph capture
+-        e.m.prompt = @import("prompt_dense.zig").Prompt.of(gpa, d, e.m.rounding(&e.c), prompt_rows, e.w.layers) catch |err| blk: { // without cuBLASLt, prompt rows keep the decode kernels
++        const pd = @import("prompt_dense.zig");
++        e.m.prompt = if (!pd.usedBy(&e.c)) null else pd.Prompt.of(gpa, d, e.m.rounding(&e.c), prompt_rows, e.w.layers) catch |err| blk: { // without cuBLASLt, prompt rows keep the decode kernels
+             std.log.warn("inkling2: prompt projections on the decode kernels ({s})", .{@errorName(err)});
+             break :blk null;
+         };
+diff --git a/zig/src/families/inkling2/prompt_dense.zig b/zig/src/families/inkling2/prompt_dense.zig
+index ea78793fe..7a9e5fc1f 100644
+--- a/zig/src/families/inkling2/prompt_dense.zig
++++ b/zig/src/families/inkling2/prompt_dense.zig
+@@ -7,6 +7,11 @@ const Buf = cuda.DeviceBuffer;
+ 
+ /// Calls of fewer rows keep exl3.Dense (decode rows, short prompts: the same bits as decode).
+ pub const min_rows = 256;
++
++/// Whether prompt rows take the GEMM: Small's do; Mini's keep the decode kernels (its loop grows the GEMM's sum order).
++pub fn usedBy(c: anytype) bool {
++    return c.loop == null;
++}
+ const workspace_bytes = 32 << 20;
+ 
+ const Plan = struct { rows: usize, k: usize, n: usize, g: lt_.Gemm };
+-- 
+2.53.0
+

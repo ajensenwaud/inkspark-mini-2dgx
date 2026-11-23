@@ -1,0 +1,86 @@
+From a5d4f3b8295741864d96b6922957ec56bdc5b45a Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 13:41:19 +1100
+Subject: [PATCH 06/24] inkling2: hold r whole when a rank's rel columns miss
+ the 128-wide blocks
+
+Mini has 24 query heads, so at two ranks each holds 12 x 16 = 192 rel
+columns, which the EXL3 cut cannot take. Such a rank projects every
+head's r and copies out its own columns; Small's 384 columns a rank keep
+the cut as before.
+---
+ zig/src/families/inkling2/forward.zig | 9 ++++++++-
+ zig/src/families/inkling2/weights.zig | 5 ++++-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 329e77740..1b5f3f393 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -141,6 +141,7 @@ pub const Buffers = struct {
+     normed: u64 = 0, // bf16 [3][rows][hidden]
+     q: u64 = 0,
+     r: u64 = 0,
++    rw: u64 = 0, // bf16 [rows][all heads x d_rel]: r held whole on a rank whose rel columns are not 128-aligned
+     gate: u64 = 0,
+     kf: u64 = 0,
+     vf: u64 = 0,
+@@ -186,6 +187,7 @@ pub const Buffers = struct {
+         b.normed = try A(&b, d, 3 * n * h * 2);
+         b.q = try A(&b, d, n * s.heads * hd * 2);
+         b.r = try A(&b, d, n * s.heads * c.d_rel * 2);
++        if (w.layers[0].attn.r_lo != null) b.rw = try A(&b, d, n * @as(usize, c.heads) * c.d_rel * 2);
+         b.gate = try A(&b, d, n * s.heads * hd * 2);
+         b.kf = try A(&b, d, n * s.kv * hd * 4);
+         b.vf = try A(&b, d, n * s.kv * hd * 4);
+@@ -439,7 +441,12 @@ pub const Forward = struct {
+             const ss = if (f.m.prompt != null and n >= prompt_dense.min_rows) s else sd.stream;
+             try sd.fork.record(s);
+             try ss.wait(sd.fork);
+-            try f.proj(ss, &sd.dense, a.r, xq, n, b.r, .bf16);
++            if (a.r_lo) |lo| { // every head's r, then this rank's columns
++                try f.proj(ss, &sd.dense, a.r, xq, n, b.rw, .bf16);
++                const all: usize = c.heads * c.d_rel * 2;
++                const m: cuda.abi.Memcpy2D = .{ .src = b.rw + lo * 2, .src_pitch = all, .dst = b.r, .dst_pitch = f.shape.heads * c.d_rel * 2, .width = f.shape.heads * c.d_rel * 2, .height = n };
++                try f.d.check(f.d.api.cuMemcpy2DAsync_v2(&m, ss.handle), "cuMemcpy2DAsync");
++            } else try f.proj(ss, &sd.dense, a.r, xq, n, b.r, .bf16);
+             try f.proj(ss, &sd.dense, a.k, xk, n, b.kf, .f32);
+             try f.proj(ss, &sd.dense, a.v, xv, n, b.vf, .f32);
+             try ops.rowdot(k, ss, xq, a.sink, b.sink, n, f.shape.heads, h, true, false);
+diff --git a/zig/src/families/inkling2/weights.zig b/zig/src/families/inkling2/weights.zig
+index a1fd87510..1852394d3 100644
+--- a/zig/src/families/inkling2/weights.zig
++++ b/zig/src/families/inkling2/weights.zig
+@@ -29,6 +29,7 @@ pub const Attention = struct {
+     k_conv: u64, // sliding: bf16 [kv * 128][4]; global: static taps bf16 [4][kv * 128]
+     v_conv: u64,
+     k_proj: u64 = 0, // global: the dynamic taps' projection, bf16 [kv * 4][hidden]
++    r_lo: ?usize = null, // r held whole (the rank's rel columns are not 128-aligned): its first column of them
+     v_proj: u64 = 0,
+ };
+ 
+@@ -140,11 +141,12 @@ const Loader = struct {
+         const q: shard.Span = .{ .lo = s.heads.lo * D, .hi = s.heads.hi * D };
+         const kv: shard.Span = .{ .lo = s.kv.lo * D, .hi = s.kv.hi * D };
+         const rel: shard.Span = .{ .lo = s.heads.lo * c.d_rel, .hi = s.heads.hi * c.d_rel };
++        const aligned = rel.lo % 128 == 0 and rel.len() % 128 == 0; // Mini at two ranks: 12 heads x 16 = 192 columns
+         var a: Attention = .{
+             .q = try L.lin(i, "wq_du", H * D, h, .{ .cols = q }),
+             .k = try L.lin(i, "wk_dv", KV * D, h, .{ .cols = kv }),
+             .v = try L.lin(i, "wv_dv", KV * D, h, .{ .cols = kv }),
+-            .r = try L.lin(i, "wr_du", H * c.d_rel, h, if (s.whole()) .whole else .{ .cols = rel }),
++            .r = try L.lin(i, "wr_du", H * c.d_rel, h, if (s.whole() or !aligned) .whole else .{ .cols = rel }),
+             .gate = try L.lin(i, "gate_attn", H * D, h, .{ .cols = q }),
+             .o = try L.lin(i, "wo_ud", h, H * D, .{ .rows = q }),
+             .sink = try L.rows(try L.expect("layers.{d}.attn.attn_sink_proj.weight", .{i}, .bf16, &.{ H, h }), s.heads.lo, s.heads.hi),
+@@ -153,6 +155,7 @@ const Loader = struct {
+             .rel_proj = try L.rows(try L.expect("layers.{d}.attn.rel_logits_proj.proj", .{i}, .bf16, &.{ c.d_rel, c.rel_extent }), 0, c.d_rel),
+             .k_conv = 0,
+             .v_conv = 0,
++            .r_lo = if (s.whole() or aligned) null else rel.lo,
+         };
+         if (c.layer[i] == .sliding) {
+             a.k_conv = try L.rows(try L.expect("layers.{d}.attn.k_sconv.weight", .{i}, .bf16, &.{ KV * D, 1, c.conv }), kv.lo, kv.hi);
+-- 
+2.53.0
+

@@ -1,0 +1,1091 @@
+From d96dc5bd3aabb0f68a9a09d66b5f79cb0a9a3e98 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 04:39:30 +1100
+Subject: [PATCH 22/24] inkling2: Mini's draft pass takes every stream through
+ each launch once
+
+The pass already ran the drafter's projections over every block's rows, but
+the attention, q/k prep, Markov context, recurrence and picks still ran a
+stream at a time, and so did each stream's absorb. At 8 streams that cost as
+much as a whole 8-row forward. Mini now runs one launch a step for all
+streams (dspark_many.cuh, a stream table uploaded once a pass), absorbs
+every stream's kept rows together, and drafts at every width by default.
+Each row's arithmetic is the per-stream kernels', so the drafts are the
+same bits. Small keeps its released pass. TF_INKLING2_DRAFT_BATCH=0 puts
+Mini back on the per-stream pass; tf-inkling2-engine multi checks drafted
+== plain at 1/2/4/8 streams and the two passes against each other.
+---
+ docs/environment.md                        |   3 +-
+ zig/kernels/cuda/inkling2/dspark.cu        |   2 +
+ zig/kernels/cuda/inkling2/dspark_many.cuh  | 308 +++++++++++++++++++++
+ zig/src/families/inkling2/dspark_many.zig  | 249 +++++++++++++++++
+ zig/src/families/inkling2/dspark_ops.zig   |  94 +++++++
+ zig/src/families/inkling2/dspark_run.zig   |  18 +-
+ zig/src/families/inkling2/engine.zig       |  13 +-
+ zig/src/families/inkling2/engine_main.zig  |   4 +-
+ zig/src/families/inkling2/engine_multi.zig | 123 ++++++++
+ zig/src/families/inkling2/lanes.zig        |   6 +-
+ zig/src/families/inkling2/native.zig       |   2 +-
+ zig/src/platform/environment.zig           |   1 +
+ zig/src/platform/environment_test.zig      |   1 +
+ 13 files changed, 812 insertions(+), 12 deletions(-)
+ create mode 100644 zig/kernels/cuda/inkling2/dspark_many.cuh
+ create mode 100644 zig/src/families/inkling2/dspark_many.zig
+ create mode 100644 zig/src/families/inkling2/engine_multi.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 22605751b..f7a8d0b7b 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -81,7 +81,8 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TF_INKLING2_KV` | Inkling 2 on CUDA: `fp8` stores the global layers' keys and values as e4m3 with an fp32 scale a token and key head (about half the bytes of a stream); `bf16` (default) keeps them in bf16. Sliding layers stay bf16 |
+ | `TF_INKLING2_DRAFT_WEIGHTS` | Inkling 2 on CUDA: `nvfp4` quantises the bundled drafter's projections to NVFP4 at load (round to nearest); `bf16` (default) keeps them as released. Changes acceptance, never output |
+ | `TF_INKLING2_PROFILE` | Inkling 2 on CUDA: `1` times a round's phases on each rank and logs a line every 200 rounds (syncs the forward; off by default) |
+-| `TF_INKLING2_PLAIN_STREAMS` | Inkling 2 on CUDA: shared decode rounds of this many streams or more draft nothing; `0` lets every width draft. Unset: 2 (from two streams on, rounds run plain). Changes speed, never output |
++| `TF_INKLING2_PLAIN_STREAMS` | Inkling 2 on CUDA: shared decode rounds of this many streams or more draft nothing; `0` lets every width draft. Unset: 2 on Small (from two streams on, rounds run plain), 0 on Mini (its batched pass drafts at every width; the depth rule still gives a stream no drafts when they do not pay). Changes speed, never output |
++| `TF_INKLING2_DRAFT_BATCH` | Inkling 2 Mini on CUDA: `0` runs the draft pass's absorbs, attention and walk launches one stream at a time, as before the batched pass; unset or `1` puts every stream through each launch once. Small always keeps its released pass. Changes speed, never output or drafts |
+ | `TF_PROMPT_ROWS` | Native serving: a multiple of 16 from 128 through 2048; unset keeps the chip/family default |
+ | `TF_ANE_COLUMNS` | Whole u32 count; zero disables the experimental share; default zero |
+ | `TF_METAL4` | Metal: exactly `0` or `1`; `1` sends a family's GPU work through Metal 4 (macOS 26 and later) where the family supports it: the same kernels in the same order, with Metal 4's command queue, allocators, argument tables and barriers, and bit-identical outputs; `0` keeps Metal 3. DeepSeek-V4.1 defaults to `1` where the Mac has Metal 4 (its device test rigs to `0`); Macs without it stay on Metal 3 |
+diff --git a/zig/kernels/cuda/inkling2/dspark.cu b/zig/kernels/cuda/inkling2/dspark.cu
+index 3426aae0c..55df8aa0a 100644
+--- a/zig/kernels/cuda/inkling2/dspark.cu
++++ b/zig/kernels/cuda/inkling2/dspark.cu
+@@ -368,3 +368,5 @@ extern "C" __global__ void tf_ink2_dsp_pick(const float* __restrict__ picks, int
+     }
+     walk[j + 1] = bi;
+ }
++
++#include "inkling2/dspark_many.cuh"
+diff --git a/zig/kernels/cuda/inkling2/dspark_many.cuh b/zig/kernels/cuda/inkling2/dspark_many.cuh
+new file mode 100644
+index 000000000..a2c5dd825
+--- /dev/null
++++ b/zig/kernels/cuda/inkling2/dspark_many.cuh
+@@ -0,0 +1,308 @@
++// Inkling 2's DSpark drafter, every stream of a pass in one launch a step (Mini's batched pass; dspark_many.zig).
++#pragma once
++
++// One stream of a batched pass (dspark_many.zig's Stream): its slot's caches by layer, f_rnn, anchor, keys, race.
++struct DspStream {
++    uint16_t* kc[8];
++    uint16_t* vc[8];
++    const uint16_t* frnn;
++    unsigned long long seed;
++    int p, race;
++    float inv_t;
++    int lo[8];
++    int pad;
++};
++
++namespace ink2m {
++
++__device__ __forceinline__ bool better(float v, int i, float bv, int bi) { return v > bv || (v == bv && i < bi); }
++
++// sample.cu's keys (as ops.cu's tf_ink2_race1)
++__device__ __forceinline__ unsigned long long mix(unsigned long long x) {
++    x ^= x >> 30;
++    x *= 0xBF58476D1CE4E5B9ull;
++    x ^= x >> 27;
++    x *= 0x94D049BB133111EBull;
++    return x ^ (x >> 31);
++}
++
++__device__ __forceinline__ float race_uniform(unsigned long long seed, unsigned pos, unsigned id) {
++    unsigned long long x = mix(seed + 0x9E3779B97F4A7C15ull);
++    x = mix(x ^ (static_cast<unsigned long long>(pos) * 0xD1B54A32D192ED03ull));
++    x = mix(x ^ static_cast<unsigned long long>(id));
++    const float u = (static_cast<float>(static_cast<unsigned>(x >> 40)) + 0.5f) * (1.0f / 16777216.0f);
++    return fminf(u, __uint_as_float(0x3F7FFFFFu));
++}
++
++}  // namespace ink2m
++
++// tf_ink2_dsp_qk over every stream's rows: row r is stream at[2r]'s position at[2r + 1], into that slot's caches.
++extern "C" __global__ void __launch_bounds__(64) tf_ink2_dsp_qk_many(QkArgs a, const DspStream* __restrict__ st,
++                                                                     const int* __restrict__ at, int layer) {
++    using namespace ink2d;
++    __shared__ float sh[32];
++    const int row = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
++    const bool isq = h < a.hq;
++    const uint16_t* x = a.x + row * a.ld + static_cast<long long>(h) * kD;
++    const float x0 = bf(x[i]), x1 = bf(x[i + 64]);
++    const float inv = 1.0f / sqrtf(blockSum(x0 * x0 + x1 * x1, sh) / kD + a.eps);
++    const uint16_t* w = isq ? a.qw : a.kw;
++    const float y0 = bfr(x0 * inv * bf(w[i])), y1 = bfr(x1 * inv * bf(w[i + 64]));
++    const int pos = at[2 * row + 1];
++    const float f = static_cast<float>(pos) * (1.0f / powf(a.theta, static_cast<float>(2 * i) / kD));
++    const float co = cosf(f), si = sinf(f);
++    const uint16_t o0 = tobf(y0 * co - y1 * si), o1 = tobf(y1 * co + y0 * si);
++    if (isq) {
++        uint16_t* q = a.q + (static_cast<size_t>(row) * a.hq + h) * kD;
++        q[i] = o0;
++        q[i + 64] = o1;
++        return;
++    }
++    const DspStream& s = st[at[2 * row]];
++    uint16_t* kc = s.kc[layer];
++    uint16_t* vc = s.vc[layer];
++    const int j = h - a.hq;
++    const size_t o = (static_cast<size_t>(pos % a.ring) * a.hk + j) * kD;
++    kc[o + i] = o0;
++    kc[o + i + 64] = o1;
++    const uint16_t* v = a.x + row * a.ld + static_cast<long long>(a.hq + a.hk + j) * kD;
++    vc[o + i] = v[i];
++    vc[o + i + 64] = v[i + 64];
++}
++
++// tf_ink2_dsp_attn for every stream's block (blockIdx.z): its keys [lo, p + T - 1], partials maxc chunks apart.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_dsp_attn_many(AttnArgs a, const DspStream* __restrict__ st, int layer,
++                                                                        int maxc) {
++    using namespace ink2d;
++    __shared__ float sq[kMaxQ][kD];
++    __shared__ uint16_t sk[kKT][kD + 8];
++    __shared__ uint16_t sv[kKT][kD];
++    __shared__ float sp[kMaxQ][kKT];
++    __shared__ float sm[kMaxQ], sl[kMaxQ], sa[kMaxQ];
++    const DspStream& S = st[blockIdx.z];
++    const int lo = S.lo[layer], hi = S.p + a.T - 1;
++    if (static_cast<int>(blockIdx.x) > hi / kChunk - lo / kChunk) return;
++    const int j = blockIdx.y, c = lo / kChunk + blockIdx.x, tid = threadIdx.x;
++    const int g = a.hq / a.hk, nq = a.T * g, nqt = a.T * a.hq;
++    const uint16_t* aq = a.q + static_cast<size_t>(blockIdx.z) * nqt * kD;
++    const uint16_t* kc = S.kc[layer];
++    const uint16_t* vc = S.vc[layer];
++    float* po = a.po + static_cast<size_t>(blockIdx.z) * maxc * nqt * kD;
++    float* pml = a.pml + static_cast<size_t>(blockIdx.z) * maxc * nqt * 2;
++    const int k0 = max(lo, c * kChunk), k1 = min(hi + 1, (c + 1) * kChunk);
++    for (int idx = tid; idx < nq * kD; idx += blockDim.x) {
++        const int qi = idx / kD, d = idx % kD;
++        sq[qi][d] = bf(aq[(static_cast<size_t>(qi / g) * a.hq + j * g + qi % g) * kD + d]);
++    }
++    for (int qi = tid; qi < nq; qi += blockDim.x) {
++        sm[qi] = -INFINITY;
++        sl[qi] = 0.0f;
++    }
++    const int d = tid & (kD - 1), half = tid >> 7;
++    float o[kMaxQ / 2];
++    for (int r = 0; r < kMaxQ / 2; ++r) o[r] = 0.0f;
++    __syncthreads();
++    for (int kt = k0; kt < k1; kt += kKT) {
++        const int nk = min(kKT, k1 - kt);
++        for (int idx = tid; idx < nk * kD; idx += blockDim.x) {
++            const int kk = idx / kD, dd = idx % kD;
++            const size_t at = (static_cast<size_t>((kt + kk) % a.ring) * a.hk + j) * kD + dd;
++            sk[kk][dd] = kc[at];
++            sv[kk][dd] = vc[at];
++        }
++        __syncthreads();
++        for (int idx = tid; idx < nq * kKT; idx += blockDim.x) {
++            const int qi = idx / kKT, kk = idx % kKT;
++            float s = -INFINITY;
++            if (kk < nk) {
++                s = 0.0f;
++                for (int dd = 0; dd < kD; ++dd) s += sq[qi][dd] * bf(sk[kk][dd]);
++                s *= a.scale;
++            }
++            sp[qi][kk] = s;
++        }
++        __syncthreads();
++        for (int qi = tid; qi < nq; qi += blockDim.x) {
++            float mx = sm[qi];
++            for (int kk = 0; kk < nk; ++kk) mx = fmaxf(mx, sp[qi][kk]);
++            const float al = expf(sm[qi] - mx);
++            float sum = 0.0f;
++            for (int kk = 0; kk < nk; ++kk) {
++                const float p = expf(sp[qi][kk] - mx);
++                sp[qi][kk] = p;
++                sum += p;
++            }
++            sl[qi] = sl[qi] * al + sum;
++            sm[qi] = mx;
++            sa[qi] = al;
++        }
++        __syncthreads();
++        for (int r = 0; r < kMaxQ / 2; ++r) {
++            const int qi = half * (kMaxQ / 2) + r;
++            if (qi >= nq) break;
++            float acc = o[r] * sa[qi];
++            for (int kk = 0; kk < nk; ++kk) acc += sp[qi][kk] * bf(sv[kk][d]);
++            o[r] = acc;
++        }
++        __syncthreads();
++    }
++    for (int r = 0; r < kMaxQ / 2; ++r) {
++        const int qi = half * (kMaxQ / 2) + r;
++        if (qi >= nq) break;
++        const size_t rh = static_cast<size_t>(blockIdx.x) * nqt + (qi / g) * a.hq + j * g + qi % g;
++        po[rh * kD + d] = o[r];
++        if (d == 0) {
++            pml[rh * 2] = sm[qi];
++            pml[rh * 2 + 1] = sl[qi];
++        }
++    }
++}
++
++// tf_ink2_dsp_merge for every stream (blockIdx.y): its chunks folded in order into its block's rows of out.
++extern "C" __global__ void __launch_bounds__(128) tf_ink2_dsp_merge_many(const float* __restrict__ po, const float* __restrict__ pml,
++                                                                         const DspStream* __restrict__ st, int layer, int T,
++                                                                         int maxc, int nqt, uint16_t* __restrict__ out) {
++    using namespace ink2d;
++    const DspStream& S = st[blockIdx.y];
++    const int chunks = (S.p + T - 1) / kChunk - S.lo[layer] / kChunk + 1;
++    po += static_cast<size_t>(blockIdx.y) * maxc * nqt * kD;
++    pml += static_cast<size_t>(blockIdx.y) * maxc * nqt * 2;
++    out += static_cast<size_t>(blockIdx.y) * nqt * kD;
++    const size_t rh = blockIdx.x;
++    const int d = threadIdx.x;
++    float mx = -INFINITY;
++    for (int c = 0; c < chunks; ++c) mx = fmaxf(mx, pml[(c * nqt + rh) * 2]);
++    float l = 0.0f, acc = 0.0f;
++    for (int c = 0; c < chunks; ++c) {
++        const float m = pml[(c * nqt + rh) * 2];
++        const float wt = m == -INFINITY ? 0.0f : expf(m - mx);
++        l += pml[(c * nqt + rh) * 2 + 1] * wt;
++        acc += po[(c * nqt + rh) * kD + d] * wt;
++    }
++    out[rh * kD + d] = tobf(acc / l);
++}
++
++// tf_ink2_dsp_ctx for every stream (blockIdx.y): its hidden rows hstride elements apart, its slot's f_rnn.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_dsp_ctx_many(const uint16_t* __restrict__ hidden, long long hstride,
++                                                                       const DspStream* __restrict__ st, const uint16_t* __restrict__ W,
++                                                                       const uint16_t* __restrict__ bias, float* __restrict__ out,
++                                                                       int rows, int C, int R) {
++    using namespace ink2d;
++    const int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    if (o >= 3 * R) return;
++    hidden += blockIdx.y * hstride;
++    out += static_cast<size_t>(blockIdx.y) * rows * 3 * R;
++    const uint16_t* frnn = st[blockIdx.y].frnn;
++    const uint16_t* w = W + static_cast<size_t>(o) * (2 * R + 2 * C) + 2 * R;
++    float acc[kMaxRows];
++    for (int r = 0; r < kMaxRows; ++r) acc[r] = 0.0f;
++    for (int k = lane; k < 2 * C; k += 32) {
++        const float wk = bf(w[k]);
++        if (k < C) {
++            for (int r = 0; r < kMaxRows; ++r)
++                if (r < rows) acc[r] += wk * bf(hidden[static_cast<size_t>(r) * C + k]);
++        } else {
++            const float f = wk * bf(frnn[k - C]);
++            for (int r = 0; r < kMaxRows; ++r) acc[r] += f;
++        }
++    }
++    for (int r = 0; r < kMaxRows; ++r) {
++        const float s = warpSum(acc[r]);
++        if (lane == 0 && r < rows) out[static_cast<size_t>(r) * 3 * R + o] = s + bf(bias[o]);
++    }
++}
++
++// tf_ink2_dsp_rnn for every stream (a block each): ctx rows cstride apart, walks T apart, states and latents R apart.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_dsp_rnn_many(const float* __restrict__ ctx, long long cstride,
++                                                                       const uint16_t* __restrict__ W, const uint16_t* __restrict__ w1,
++                                                                       const int* __restrict__ walk, int T, int j,
++                                                                       uint16_t* __restrict__ state, uint16_t* __restrict__ latent,
++                                                                       int R, int C) {
++    using namespace ink2d;
++    __shared__ float in[512];
++    __shared__ float raw[768];
++    const int c = threadIdx.x, lane = c & 31, wp = c >> 5, nw = blockDim.x >> 5;
++    ctx += blockIdx.x * cstride;
++    walk += blockIdx.x * T;
++    state += blockIdx.x * R;
++    latent += blockIdx.x * R;
++    const size_t prev = static_cast<size_t>(walk[j]);
++    in[c] = bf(state[c]);
++    in[R + c] = bf(w1[prev * R + c]);
++    __syncthreads();
++    const int ld = 2 * R + 2 * C;
++    for (int o = wp; o < 3 * R; o += nw) {
++        float s = 0.0f;
++        for (int k = lane; k < 2 * R; k += 32) s += bf(W[static_cast<size_t>(o) * ld + k]) * in[k];
++        s = warpSum(s);
++        if (lane == 0) raw[o] = s + ctx[o];
++    }
++    __syncthreads();
++    const float gate = bfr(1.0f / (1.0f + expf(-bfr(raw[c]))));
++    const float cand = bfr(tanhf(bfr(raw[R + c])));
++    const float keep = bfr(gate * in[c]);
++    const float upd = bfr(bfr(1.0f - gate) * cand);
++    state[c] = tobf(keep + upd);
++    latent[c] = tobf(tanhf(bfr(raw[2 * R + c])));
++}
++
++// Each stream's step pick (a block each): greedy over nv columns or its keyed race over valid, into picks 16 B apart.
++extern "C" __global__ void __launch_bounds__(1024) tf_ink2_dsp_pick_many(const float* __restrict__ scores, int nv, int valid,
++                                                                         int base, const DspStream* __restrict__ st, int step,
++                                                                         float* __restrict__ picks) {
++    using namespace ink2d;
++    using ink2m::better;
++    __shared__ float sv[32];
++    __shared__ int si[32];
++    const DspStream& S = st[blockIdx.x];
++    const float* r = scores + static_cast<size_t>(blockIdx.x) * nv;
++    float bv = -INFINITY;
++    int bi = 0x7fffffff;
++    if (S.race) {
++        const unsigned pos = static_cast<unsigned>(S.p + 1 + step);
++        for (int i = threadIdx.x; i < valid; i += blockDim.x) {
++            const float v = bfr(r[i]) * S.inv_t - logf(-logf(ink2m::race_uniform(S.seed, pos, static_cast<unsigned>(base + i))));
++            if (better(v, i, bv, bi)) {
++                bv = v;
++                bi = i;
++            }
++        }
++    } else {
++        for (int i = threadIdx.x; i < nv; i += blockDim.x) {
++            if (better(r[i], i, bv, bi)) {
++                bv = r[i];
++                bi = i;
++            }
++        }
++    }
++    for (int o = 16; o > 0; o >>= 1) {
++        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++        if (better(ov, oi, bv, bi)) {
++            bv = ov;
++            bi = oi;
++        }
++    }
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    if (lane == 0) {
++        sv[warp] = bv;
++        si[warp] = bi;
++    }
++    __syncthreads();
++    if (warp != 0) return;
++    const int nw = blockDim.x >> 5;
++    bv = lane < nw ? sv[lane] : -INFINITY;
++    bi = lane < nw ? si[lane] : 0x7fffffff;
++    for (int o = 16; o > 0; o >>= 1) {
++        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++        if (better(ov, oi, bv, bi)) {
++            bv = ov;
++            bi = oi;
++        }
++    }
++    if (lane == 0) {
++        picks[blockIdx.x * 4] = bv;
++        reinterpret_cast<int*>(picks)[blockIdx.x * 4 + 1] = (bi == 0x7fffffff ? 0 : bi) + base;
++    }
++}
+diff --git a/zig/src/families/inkling2/dspark_many.zig b/zig/src/families/inkling2/dspark_many.zig
+new file mode 100644
+index 000000000..bac13da27
+--- /dev/null
++++ b/zig/src/families/inkling2/dspark_many.zig
+@@ -0,0 +1,249 @@
++//! Mini's batched draft pass: every stream's absorb and block through each launch once (dspark_many.cuh).
++const std = @import("std");
++const cuda = @import("cuda");
++const fw = @import("forward.zig");
++const ops = @import("ops.zig");
++const ds = @import("dspark.zig");
++const dk = @import("dspark_ops.zig");
++const drun = @import("dspark_run.zig");
++
++const Buf = cuda.DeviceBuffer;
++const T = ds.block;
++const most = drun.max_streams;
++
++/// A stream's kept rows (its slot's stash) absorbed at positions p0.. before any block of the pass.
++pub const Absorb = struct { slot: *drun.Slot, rows: usize, p0: usize };
++
++/// The host table a pass uploads once: streams, rows' (stream, position) for blocks and absorbs, anchors, walks.
++const Table = extern struct {
++    streams: [most]dk.Stream,
++    blk: [most * T][2]i32,
++    abs: [most * T][2]i32,
++    ids: [most]i32,
++    walk: [most * T]i32,
++};
++
++/// What the batched pass adds to a drafter: the table, the absorbed rows' taps, masks for every block, partials.
++pub const Scratch = struct {
++    tab: Buf,
++    taps: Buf, // bf16 [most * T][taps_n][hidden]: the absorbed rows' taps side by side
++    masks: Buf, // bf16 [most][T - 1][hidden]: every block's rows past its anchor
++    anchors: Buf, // bf16 [most][hidden]: the blocks' embedded anchors
++    po: ?Buf = null,
++    pml: ?Buf = null,
++    slots: usize = 0, // streams x chunks the partials hold
++
++    pub fn init(dr: *drun.Drafter, s: cuda.Stream) !Scratch {
++        const h = dr.hidden;
++        var tab = try Buf.alloc(dr.d, @sizeOf(Table));
++        errdefer tab.free();
++        var taps = try Buf.alloc(dr.d, most * T * @as(usize, dr.w.c.taps_n) * h * 2);
++        errdefer taps.free();
++        var masks = try Buf.alloc(dr.d, most * (T - 1) * h * 2);
++        errdefer masks.free();
++        var anchors = try Buf.alloc(dr.d, most * h * 2);
++        errdefer anchors.free();
++        for (0..most * (T - 1)) |r| try dr.copy(s, masks.ptr + r * h * 2, dr.w.mask, h * 2);
++        try s.synchronize();
++        return .{ .tab = tab, .taps = taps, .masks = masks, .anchors = anchors };
++    }
++
++    pub fn deinit(x: *Scratch) void {
++        for ([_]*Buf{ &x.tab, &x.taps, &x.masks, &x.anchors }) |b| b.free();
++        if (x.po) |*b| b.free();
++        if (x.pml) |*b| b.free();
++    }
++
++    /// Partials for `n` (stream, chunk) pairs of T x hq rows (grown, never shrunk; the last pass has synchronised).
++    fn grow(x: *Scratch, d: *const cuda.Driver, n: usize, hq: usize) !void {
++        if (n <= x.slots) return;
++        if (x.po) |*b| b.free();
++        if (x.pml) |*b| b.free();
++        x.po = null;
++        x.pml = null;
++        x.slots = 0;
++        x.po = try Buf.alloc(d, n * T * hq * 128 * 4);
++        x.pml = try Buf.alloc(d, n * T * hq * 2 * 4);
++        x.slots = n;
++    }
++};
++
++fn off(comptime field: []const u8) u64 {
++    return @offsetOf(Table, field);
++}
++
++/// A sliding draft layer keeps its window, the global layer the slot's whole context.
++fn lowKey(c: *const ds.Config, l: usize, slot: *const drun.Slot, p: usize) usize {
++    return if (c.local[l]) @max(slot.from, p -| c.window) else slot.from;
++}
++
++/// Every stream's kept rows absorbed, then every block drafted: each step one launch for all streams.
++pub fn pass(dr: *drun.Drafter, m: *fw.Modules, s: cuda.Stream, ex: fw.Exchange, t: anytype, abs: []const Absorb, bs: []const drun.Block) !void {
++    const x = &(dr.many orelse return error.Inkling2DraftShape);
++    const c = &dr.w.c;
++    const S = bs.len;
++    if (S > dr.streams or abs.len > most) return error.Inkling2DraftShape;
++    var tb: Table = undefined;
++    @memset(std.mem.asBytes(&tb), 0);
++    var n_abs: usize = 0; // absorbed rows
++    var ents: usize = S; // table entries: the blocks' streams, then streams that only absorb
++    for (abs) |a| {
++        if (a.rows == 0 or a.rows > T or n_abs + a.rows > dr.ctx_rows) return error.Inkling2DraftShape;
++        const e = for (bs, 0..) |b, j| {
++            if (b.slot == a.slot) break j;
++        } else blk: {
++            if (ents == most) return error.Inkling2DraftShape;
++            ents += 1;
++            break :blk ents - 1;
++        };
++        fill(&tb.streams[e], c, a.slot);
++        for (0..a.rows) |r| tb.abs[n_abs + r] = .{ @intCast(e), @intCast(a.p0 + r) };
++        n_abs += a.rows;
++        if (a.slot.to != a.p0) a.slot.from = a.p0; // a gap: the context starts again here (absorb's rule)
++        a.slot.to = a.p0 + a.rows;
++    }
++    var maxc: [ds.max_layers]usize = @splat(0);
++    for (bs, 0..) |b, j| {
++        if (b.out.len == 0 or b.out.len > T - 1 or b.p + T > dr.capacity) return error.Inkling2DraftShape;
++        if (b.slot.to != b.p) {
++            b.slot.from = b.p;
++            b.slot.to = b.p;
++        }
++        const st = &tb.streams[j];
++        fill(st, c, b.slot);
++        st.p = @intCast(b.p);
++        if (b.race) |rc| {
++            st.race = 1;
++            st.seed = rc.seed;
++            st.inv_t = rc.inv_t;
++        }
++        for (0..c.layers) |l| {
++            const lo = lowKey(c, l, b.slot, b.p);
++            st.lo[l] = @intCast(lo);
++            maxc[l] = @max(maxc[l], dk.chunks(lo, b.p + T - 1));
++        }
++        for (0..T) |r| tb.blk[j * T + r] = .{ @intCast(j), @intCast(b.p + r) };
++        tb.ids[j] = @intCast(b.anchor);
++        @memset(tb.walk[j * T ..][0..T], @intCast(b.anchor));
++    }
++    var deepest: usize = 0;
++    for (maxc[0..c.layers]) |n| deepest = @max(deepest, n);
++    try x.grow(dr.d, S * deepest, dr.hq);
++    try cuda.copy_source.enqueue(dr.d, x.tab.ptr, std.mem.asBytes(&tb), s);
++    const tab = x.tab.ptr;
++    if (n_abs > 0) try absorbAll(dr, s, abs, n_abs, tab + off("abs"));
++    if (S == 0) return;
++    try blocks(dr, m, s, ex, t, bs, maxc, tab);
++}
++
++fn fill(st: *dk.Stream, c: *const ds.Config, slot: *const drun.Slot) void {
++    for (0..c.layers) |l| {
++        st.kc[l] = slot.keys(l);
++        st.vc[l] = slot.values(l);
++    }
++    st.frnn = slot.frnn;
++}
++
++/// The absorbs' rows side by side: per layer one tap mix, one kv projection, one q/k prep into each slot.
++fn absorbAll(dr: *drun.Drafter, s: cuda.Stream, abs: []const Absorb, rows: usize, at: u64) !void {
++    const x = &dr.many.?;
++    const c = &dr.w.c;
++    const h = dr.hidden;
++    const tn: usize = c.taps_n;
++    const row_bytes = tn * h * 2;
++    var r: usize = 0;
++    for (abs) |a| {
++        try dr.copy(s, x.taps.ptr + r * row_bytes, a.slot.stash, a.rows * row_bytes);
++        r += a.rows;
++    }
++    for (dr.w.layers[0..c.layers], 0..) |l, i| {
++        try dk.mix(&dr.k, s, x.taps.ptr, dr.w.alpha + i * tn * 4, l.dflare, dr.mixed, rows, tn, h, c.eps);
++        try dr.mm(s, l.kv, dr.mixed, rows, dr.ckv, .bf16);
++        const q: dk.QkArgs = .{ .x = dr.ckv, .qw = 0, .kw = l.k_norm_ctx, .q = 0, .kc = 0, .vc = 0, .ld = @intCast(2 * dr.hk * 128), .hq = 0, .hk = @intCast(dr.hk), .ring = @intCast(drun.ring(c, i, dr.capacity)), .pos0 = 0, .eps = c.eps, .theta = c.theta };
++        try dk.qkMany(&dr.k, s, q, x.tab.ptr, at, i, rows);
++    }
++    r = 0;
++    for (abs) |a| {
++        r += a.rows;
++        try dk.mix(&dr.k, s, x.taps.ptr + (r - 1) * row_bytes, dr.w.alpha + c.layers * tn * 4, dr.w.m_norm, a.slot.frnn, 1, tn, h, c.eps);
++    }
++}
++
++/// The blocks: layers and head over every block's rows, each layer's attention one launch, then the walks together.
++fn blocks(dr: *drun.Drafter, m: *fw.Modules, s: cuda.Stream, ex: fw.Exchange, t: anytype, bs: []const drun.Block, maxc: [ds.max_layers]usize, tab: u64) !void {
++    const x = &dr.many.?;
++    const c = &dr.w.c;
++    const h = dr.hidden;
++    const S = bs.len;
++    const rows = S * T;
++    const walk = tab + off("walk");
++    try ops.embed(&m.ops, s, tab + off("ids"), S, t.embed, t.embed_norm, x.anchors.ptr, h, t.config.eps);
++    try copy2d(dr, s, dr.resid, T * h * 2, x.anchors.ptr, h * 2, h * 2, S); // each block's anchor row
++    try copy2d(dr, s, dr.resid + h * 2, T * h * 2, x.masks.ptr, (T - 1) * h * 2, (T - 1) * h * 2, S); // then its masks
++    try dk.addNorm(&dr.k, s, dr.resid, 0, 0, 0, dr.w.layers[0].in_norm, dr.x, rows, h, c.eps);
++    const L = dr.w.layers[0..c.layers];
++    const scale: f32 = 1.0 / @sqrt(128.0);
++    const qkvw = (dr.hq + 2 * dr.hk) * 128;
++    for (L, 0..) |l, i| {
++        try dr.mm(s, l.qkv, dr.x, rows, dr.qkv, .bf16);
++        const r: i32 = @intCast(drun.ring(c, i, dr.capacity));
++        const q: dk.QkArgs = .{ .x = dr.qkv, .qw = l.q_norm, .kw = l.k_norm, .q = dr.q, .kc = 0, .vc = 0, .ld = @intCast(qkvw), .hq = @intCast(dr.hq), .hk = @intCast(dr.hk), .ring = r, .pos0 = 0, .eps = c.eps, .theta = c.theta };
++        try dk.qkMany(&dr.k, s, q, tab, tab + off("blk"), i, rows);
++        const at: dk.AttnArgs = .{ .q = dr.q, .kc = 0, .vc = 0, .po = x.po.?.ptr, .pml = x.pml.?.ptr, .T = T, .hq = @intCast(dr.hq), .hk = @intCast(dr.hk), .ring = r, .lo = 0, .hi = 0, .c0 = 0, .scale = scale };
++        try dk.attendMany(&dr.k, s, at, tab, i, S, maxc[i], dr.att);
++        try dr.mm(s, l.o, dr.att, rows, dr.mySlot(rows), .f32);
++        try dr.gather(s, ex, rows);
++        try dk.addNorm(&dr.k, s, dr.resid, dr.gath, dr.world, rows * h, l.post_norm, dr.x, rows, h, c.eps);
++        try dr.mm(s, l.gu, dr.x, rows, dr.gu, .bf16);
++        try dk.silu(&dr.k, s, dr.gu, dr.act, rows, dr.inter);
++        try dr.mm(s, l.down, dr.act, rows, dr.mySlot(rows), .f32);
++        try dr.gather(s, ex, rows);
++        const next = if (i + 1 < L.len) L[i + 1].in_norm else dr.w.norm;
++        try dk.addNorm(&dr.k, s, dr.resid, dr.gath, dr.world, rows * h, next, dr.x, rows, h, c.eps);
++    }
++    // rows 1..7 of each block: the head's base logits (one block alone keeps its 7-row call), the walks
++    if (S == 1) try m.dense.decode(s, t.head, dr.x + h * 2, .bf16, T - 1, dr.base + dr.nv * 2, .bf16) else try m.dense.decode(s, t.head, dr.x, .bf16, rows, dr.base, .bf16);
++    const R: usize = c.rank;
++    var steps: usize = 0;
++    for (bs) |b| steps = @max(steps, b.out.len);
++    try dk.ctxMany(&dr.k, s, dr.x + h * 2, T * h, tab, dr.w.rnn, dr.w.rnn_bias, dr.mctx, S, T - 1, h, R);
++    try dr.d.check(dr.d.api.cuMemsetD8Async(dr.state, 0, S * R * 2, s.handle), "cuMemsetD8Async");
++    for (0..steps) |st| {
++        try dk.rnnMany(&dr.k, s, dr.mctx + st * 3 * R * 4, (T - 1) * 3 * R, dr.w.rnn, dr.w.w1, walk, T, st, dr.state, dr.latent, S, R, h);
++        try dk.vocabRows(&dr.k, s, dr.base + (1 + st) * dr.nv * 2, T * dr.nv, dr.latent, dr.fold, dr.fbias, dr.cap, dr.valid, dr.nv, S, dr.scores);
++        if (dr.keep_logits != 0 and S == 1) try dr.copy(s, dr.keep_logits + st * dr.nv * 4, dr.scores, dr.nv * 4);
++        const own = dr.picks + dr.rank * S * 16;
++        try dk.pickMany(&dr.k, s, dr.scores, dr.nv, dr.valid, dr.vlo, tab, st, own, S);
++        switch (ex) {
++            .local => {},
++            .nccl => |e| if (e.group) |g| try g.allGather(s, own, dr.picks, S * 16) else try e.lib.check(e.lib.api.ncclAllGather(own, dr.picks, S * 16, .u8, e.comm, s.handle), "ncclAllGather"),
++        }
++        try dk.pickRows(&dr.k, s, dr.picks, dr.world, S, walk, T, st);
++    }
++    try s.synchronize();
++    switch (ex) {
++        .local => {},
++        .nccl => |e| if (e.group) |g| try g.check(),
++    }
++    var host: [most * T]i32 = undefined;
++    try (Buf{ .d = dr.d, .ptr = walk, .len = rows * 4, .borrowed = true }).download(0, std.mem.sliceAsBytes(host[0..rows]));
++    for (bs, 0..) |b, j| for (b.out, host[j * T + 1 ..][0..b.out.len]) |*o, g| {
++        o.* = @intCast(g);
++    };
++}
++
++/// `height` rows of `width` bytes, `sp` bytes apart in src, to `dp` bytes apart in dst.
++fn copy2d(dr: *const drun.Drafter, s: cuda.Stream, dst: u64, dp: usize, src: u64, sp: usize, width: usize, height: usize) !void {
++    const p: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = sp, .dst = dst, .dst_pitch = dp, .width = width, .height = height };
++    try dr.d.check(dr.d.api.cuMemcpy2DAsync_v2(&p, s.handle), "cuMemcpy2DAsync");
++}
++
++test "dspark many: the table's rows for every stream's block and absorb, uploaded once" {
++    try std.testing.expectEqual(@as(usize, most * 192), @offsetOf(Table, "blk"));
++    try std.testing.expect(@sizeOf(Table) < 8192);
++    var c: ds.Config = .{ .window = 1024 };
++    c.local[0] = true;
++    var slot: drun.Slot = .{ .buf = undefined, .from = 100, .to = 5000 };
++    try std.testing.expectEqual(@as(usize, 3976), lowKey(&c, 0, &slot, 5000));
++    try std.testing.expectEqual(@as(usize, 100), lowKey(&c, 1, &slot, 5000));
++}
+diff --git a/zig/src/families/inkling2/dspark_ops.zig b/zig/src/families/inkling2/dspark_ops.zig
+index 38620c03d..5deca7c9f 100644
+--- a/zig/src/families/inkling2/dspark_ops.zig
++++ b/zig/src/families/inkling2/dspark_ops.zig
+@@ -55,6 +55,7 @@ pub const Kernels = struct {
+     pick: cuda.Function,
+     vocab_rows: cuda.Function,
+     pick_rows: cuda.Function,
++    many: Many,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -74,6 +75,14 @@ pub const Kernels = struct {
+             .pick = try mod.function("tf_ink2_dsp_pick"),
+             .vocab_rows = try mod.function("tf_ink2_dsp_vocab_rows"),
+             .pick_rows = try mod.function("tf_ink2_dsp_pick_rows"),
++            .many = .{
++                .qk = try mod.function("tf_ink2_dsp_qk_many"),
++                .attn = try mod.function("tf_ink2_dsp_attn_many"),
++                .merge = try mod.function("tf_ink2_dsp_merge_many"),
++                .ctx = try mod.function("tf_ink2_dsp_ctx_many"),
++                .rnn = try mod.function("tf_ink2_dsp_rnn_many"),
++                .pick = try mod.function("tf_ink2_dsp_pick_many"),
++            },
+         };
+     }
+ 
+@@ -217,7 +226,92 @@ pub fn pick(k: *const Kernels, s: cuda.Stream, picks: u64, world: usize, walk: u
+     try go(k.pick, s, .{ .x = 1 }, 1, &a);
+ }
+ 
++/// The batched pass's kernels (dspark_many.cuh): every stream of a pass in one launch.
++pub const Many = struct {
++    qk: cuda.Function,
++    attn: cuda.Function,
++    merge: cuda.Function,
++    ctx: cuda.Function,
++    rnn: cuda.Function,
++    pick: cuda.Function,
++};
++
++/// dspark_many.cuh's DspStream, field for field: a stream's caches by layer, f_rnn, anchor, keys, race.
++pub const Stream = extern struct {
++    kc: [8]u64 = @splat(0),
++    vc: [8]u64 = @splat(0),
++    frnn: u64 = 0,
++    seed: u64 = 0,
++    p: i32 = 0,
++    race: i32 = 0,
++    inv_t: f32 = 0,
++    lo: [8]i32 = @splat(0),
++    pad: i32 = 0,
++};
++
++/// q/k prep over several streams' rows: row r is stream at[2r] at position at[2r + 1] (QkArgs' kc, vc, pos0 unused).
++pub fn qkMany(k: *const Kernels, s: cuda.Stream, q: QkArgs, st: u64, at: u64, layer: usize, rows: usize) !void {
++    var a: cuda.Args = .{};
++    a.add(q);
++    a.add(st);
++    a.add(at);
++    a.add(int(layer));
++    try go(k.many.qk, s, .{ .x = @intCast(rows), .y = @intCast(q.hq + q.hk) }, 64, &a);
++}
++
++/// Every stream's block attention (streams `n`, at most `maxc` chunks each), then its merge into `out` [n][T][hq][128].
++pub fn attendMany(k: *const Kernels, s: cuda.Stream, at: AttnArgs, st: u64, layer: usize, n: usize, maxc: usize, out: u64) !void {
++    if (at.T * @divExact(at.hq, at.hk) > max_q) return error.Inkling2DraftShape;
++    var a: cuda.Args = .{};
++    a.add(at);
++    a.add(st);
++    a.add(int(layer));
++    a.add(int(maxc));
++    try go(k.many.attn, s, .{ .x = @intCast(maxc), .y = @intCast(at.hk), .z = @intCast(n) }, 256, &a);
++    var m: cuda.Args = .{};
++    for ([_]u64{ at.po, at.pml, st }) |v| m.add(v);
++    for ([_]i32{ int(layer), at.T, int(maxc), at.T * at.hq }) |v| m.add(v);
++    m.add(out);
++    try go(k.many.merge, s, .{ .x = @intCast(at.T * at.hq), .y = @intCast(n) }, 128, &m);
++}
++
++/// The Markov head's context rows of `n` streams (hidden rows `hstride` elements apart): fp32 [n][rows][3r].
++pub fn ctxMany(k: *const Kernels, s: cuda.Stream, hidden: u64, hstride: usize, st: u64, w: u64, bias: u64, out: u64, n: usize, rows: usize, c: usize, r: usize) !void {
++    var a: cuda.Args = .{};
++    a.add(hidden);
++    a.add(@as(i64, @intCast(hstride)));
++    for ([_]u64{ st, w, bias, out }) |v| a.add(v);
++    for ([_]i32{ int(rows), int(c), int(r) }) |v| a.add(v);
++    try go(k.many.ctx, s, .{ .x = @intCast((3 * r + 7) / 8), .y = @intCast(n) }, 256, &a);
++}
++
++/// One recurrence step of `n` streams' walks (ctx rows `cstride` floats apart, walks `t` apart).
++pub fn rnnMany(k: *const Kernels, s: cuda.Stream, cx: u64, cstride: usize, w: u64, w1: u64, walk: u64, t: usize, j: usize, state: u64, latent: u64, n: usize, r: usize, c: usize) !void {
++    var a: cuda.Args = .{};
++    a.add(cx);
++    a.add(@as(i64, @intCast(cstride)));
++    for ([_]u64{ w, w1, walk }) |v| a.add(v);
++    for ([_]usize{ t, j }) |v| a.add(int(v));
++    a.add(state);
++    a.add(latent);
++    for ([_]usize{ r, c }) |v| a.add(int(v));
++    try go(k.many.rnn, s, .{ .x = @intCast(n) }, @intCast(r), &a);
++}
++
++/// Each of `n` streams' step pick on this rank (greedy over nv, or raced over valid) into `picks`, 16 bytes apart.
++pub fn pickMany(k: *const Kernels, s: cuda.Stream, scores: u64, nv: usize, valid: usize, base: usize, st: u64, step: usize, picks: u64, n: usize) !void {
++    var a: cuda.Args = .{};
++    a.add(scores);
++    for ([_]usize{ nv, valid, base }) |v| a.add(int(v));
++    a.add(st);
++    a.add(int(step));
++    a.add(picks);
++    try go(k.many.pick, s, .{ .x = @intCast(n) }, 1024, &a);
++}
++
+ test "dspark ops: argument structs keep dspark.cu's layouts; chunks by absolute position" {
++    try std.testing.expectEqual(@as(usize, 192), @sizeOf(Stream));
++    try std.testing.expectEqual(@as(usize, 152), @offsetOf(Stream, "inv_t"));
+     try std.testing.expectEqual(@as(usize, 6 * 8 + 8 + 4 * 4 + 2 * 4), @sizeOf(QkArgs));
+     try std.testing.expectEqual(@as(usize, 5 * 8 + 8 * 4), @sizeOf(AttnArgs));
+     try std.testing.expectEqual(@as(usize, 1), chunks(0, 1023));
+diff --git a/zig/src/families/inkling2/dspark_run.zig b/zig/src/families/inkling2/dspark_run.zig
+index 13a61100b..b730579a0 100644
+--- a/zig/src/families/inkling2/dspark_run.zig
++++ b/zig/src/families/inkling2/dspark_run.zig
+@@ -5,6 +5,7 @@ const fw = @import("forward.zig");
+ const ops = @import("ops.zig");
+ const ds = @import("dspark.zig");
+ const dk = @import("dspark_ops.zig");
++const dmany = @import("dspark_many.zig");
+ 
+ const Buf = cuda.DeviceBuffer;
+ const T = ds.block;
+@@ -37,7 +38,7 @@ pub fn slotBytes(c: *const ds.Config, kv: usize, capacity: usize, hidden: usize)
+     return n + T * c.taps_n * hidden * 2 + hidden * 2;
+ }
+ 
+-fn ring(c: *const ds.Config, l: usize, capacity: usize) usize {
++pub fn ring(c: *const ds.Config, l: usize, capacity: usize) usize {
+     return if (c.local[l]) local_ring else capacity;
+ }
+ 
+@@ -106,6 +107,7 @@ pub const Drafter = struct {
+     mixed: u64 = 0, // bf16 [ctx_rows][hidden]
+     ckv: u64 = 0, // bf16 [ctx_rows][2 kv * 128]
+     keep_logits: u64 = 0, // a check's fp32 [T - 1][nv] of each step's logits (0: none)
++    many: ?dmany.Scratch = null, // Mini's batched pass (initMany): every stream through each launch once
+ 
+     /// Scratch for blocks and absorbs of up to `ctx_rows` rows; the Markov head folded into this rank's head rows.
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, m: *fw.Modules, s: cuda.Stream, w: ds.Weights, t: anytype, capacity: usize, ctx_rows: usize) !*Drafter {
+@@ -143,6 +145,7 @@ pub const Drafter = struct {
+     }
+ 
+     pub fn deinit(dr: *Drafter) void {
++        if (dr.many) |*x| x.deinit();
+         for (dr.bufs.items) |*b| b.free();
+         dr.bufs.deinit(dr.gpa);
+         dr.lane.unload();
+@@ -151,6 +154,11 @@ pub const Drafter = struct {
+         dr.gpa.destroy(dr);
+     }
+ 
++    /// The batched pass's scratch (Mini): absorbs and blocks of every stream through one launch a step.
++    pub fn initMany(dr: *Drafter, s: cuda.Stream) !void {
++        if (dr.many == null) dr.many = try dmany.Scratch.init(dr, s);
++    }
++
+     /// fold = head . hidden_out and fbias = head . bias (vLLM folds the bf16 head in fp64; ours is the pack's head).
+     fn foldHead(dr: *Drafter, m: *fw.Modules, s: cuda.Stream, t: anytype) !void {
+         const h = dr.hidden;
+@@ -183,12 +191,12 @@ pub const Drafter = struct {
+         try (Buf{ .d = dr.d, .ptr = dr.fbias, .len = fb.len * 2, .borrowed = true }).upload(0, std.mem.sliceAsBytes(fb));
+     }
+ 
+-    fn mm(dr: *Drafter, s: cuda.Stream, wt: cuda.qmmf.Weight, x: u64, rows: usize, y: u64, out: cuda.qmmf.Out) !void {
++    pub fn mm(dr: *Drafter, s: cuda.Stream, wt: cuda.qmmf.Weight, x: u64, rows: usize, y: u64, out: cuda.qmmf.Out) !void {
+         try dr.lane.matmulOut(s, x, wt.k, rows, wt, y, out, dr.part);
+     }
+ 
+     /// This rank's fp32 partial (`rows` rows at its slot of gath) to every rank; then the ranks' sum adds in order.
+-    fn gather(dr: *Drafter, s: cuda.Stream, ex: fw.Exchange, rows: usize) !void {
++    pub fn gather(dr: *Drafter, s: cuda.Stream, ex: fw.Exchange, rows: usize) !void {
+         const n = rows * dr.hidden * 4;
+         switch (ex) {
+             .local => {},
+@@ -196,7 +204,7 @@ pub const Drafter = struct {
+         }
+     }
+ 
+-    fn mySlot(dr: *const Drafter, rows: usize) u64 {
++    pub fn mySlot(dr: *const Drafter, rows: usize) u64 {
+         return dr.gath + dr.rank * rows * dr.hidden * 4;
+     }
+ 
+@@ -303,7 +311,7 @@ pub const Drafter = struct {
+         };
+     }
+ 
+-    fn copy(dr: *const Drafter, s: cuda.Stream, dst: u64, src: u64, bytes: usize) !void {
++    pub fn copy(dr: *const Drafter, s: cuda.Stream, dst: u64, src: u64, bytes: usize) !void {
+         try dr.d.check(dr.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, s.handle), "cuMemcpyDtoDAsync");
+     }
+ };
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index fe29dc02f..e4de722a3 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -10,6 +10,7 @@ const sampler = @import("sampler.zig");
+ const kept = @import("kept.zig");
+ const ds = @import("dspark.zig");
+ const drun = @import("dspark_run.zig");
++const dmany = @import("dspark_many.zig");
+ const vision = @import("vision.zig");
+ const image = @import("image.zig");
+ const pictures = @import("pictures.zig");
+@@ -182,6 +183,9 @@ pub const Engine = struct {
+             return err;
+         };
+         errdefer e.freeDrafter();
++        comptime @import("sys").environment.registered("TF_INKLING2_DRAFT_BATCH");
++        const batch = try @import("sys").environment.read(u64, "TF_INKLING2_DRAFT_BATCH", 1) == 1;
++        if (e.c.loop != null and batch) try e.drafter.?.initMany(e.stream); // Mini: one batched pass for every stream
+         for (&e.tap_bufs, [_]*fw.Buffers{ &e.bp, &e.bd }, [_]usize{ prompt_rows, shared_rows }) |*tb, b, rows| {
+             tb.* = try cuda.DeviceBuffer.alloc(e.d, rows * e.tap_at.n * @as(usize, e.c.hidden) * 2);
+             b.taps = tb.*.?.ptr;
+@@ -496,18 +500,25 @@ pub const Engine = struct {
+         const dr = e.drafter orelse return error.NoDraftHead;
+         if (reqs.len > drun.max_streams) return error.Inkling2DraftShape;
+         var bs: [drun.max_streams]drun.Block = undefined;
++        var abs: [drun.max_streams]dmany.Absorb = undefined;
+         var nb: usize = 0;
++        var na: usize = 0;
+         for (reqs) |r| {
+             try e.bind(r.slot);
+             const s = &e.dslots[r.slot];
+             const at = e.pos();
+-            if (r.n > 0) try dr.absorb(e.stream, s, s.stash, r.n, at - r.n);
++            if (r.n > 0 and dr.many != null) {
++                abs[na] = .{ .slot = s, .rows = r.n, .p0 = at - r.n };
++                na += 1;
++            } else if (r.n > 0) try dr.absorb(e.stream, s, s.stash, r.n, at - r.n);
+             // a sampled stream's drafts race with its own keys: drafts its verify will draw, the output unchanged
+             const race: ?drun.Race = if (e.seqs[r.slot].sampling) |sm| .{ .seed = sampler.rule(sm).seed, .inv_t = sampler.rule(sm).inv_t } else null;
+             if (r.out.len == 0) continue;
+             bs[nb] = .{ .slot = s, .anchor = r.anchor, .p = at, .race = race, .out = r.out };
+             nb += 1;
+         }
++        // Mini: every absorb and block in one batched pass; Small: one pass for the blocks, as released
++        if (dr.many != null) return dmany.pass(dr, &e.m, e.stream, e.exchange, &e.w, abs[0..na], bs[0..nb]);
+         if (nb > 0) try dr.draftMany(&e.m, e.stream, e.exchange, &e.w, bs[0..nb]); // every block in one pass
+     }
+ 
+diff --git a/zig/src/families/inkling2/engine_main.zig b/zig/src/families/inkling2/engine_main.zig
+index ca646c511..790ac04fa 100644
+--- a/zig/src/families/inkling2/engine_main.zig
++++ b/zig/src/families/inkling2/engine_main.zig
+@@ -3,9 +3,10 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const ink = @import("inkling2");
+ 
+-const usage = "usage: tf-inkling2-engine graphs|greedy|drafted|drafts|images|timing <model dir> <ids.json> <out dir> [context] [new]\n" ++
++const usage = "usage: tf-inkling2-engine graphs|greedy|drafted|multi|drafts|images|timing <model dir> <ids.json> <out dir> [context] [new]\n" ++
+     "  graphs: decode windows eager in some slots and graphed in others on the same rows; logits must match bit for bit\n" ++
+     "  greedy: each text's prompt pass then greedy decode rows, eager (writes greedy.json: name -> tokens)\n" ++
++    "  multi: drafted == plain at 1/2/4/8 streams (eager, graphed, oracle, sampled); Mini's batched == per-stream drafts\n" ++
+     "  drafts: the drafter at ~12 anchors a text after a prompt pass to each (drafts.json, drafts-r<rank>.bin)\n" ++
+     "  images: <ids.json> is a directory of NAME.png + NAME.ids.u32; spliced rows, solo/drafted/concurrent greedy\n" ++
+     "  timing: graphed windows by rows and streams, draft passes, a short keep (median ms of 16 after 3 warm)\n" ++
+@@ -63,6 +64,7 @@ pub fn main(init: std.process.Init) !u8 {
+     if (std.mem.eql(u8, args[1], "drafts")) return drafts(e, a, io, out, list.items, place.rank);
+     if (pics) return @import("engine_images.zig").run(e, a, io, args[3], out, new, r0);
+     if (std.mem.eql(u8, args[1], "timing")) return @import("engine_timing.zig").run(e, a, io, list.items, r0);
++    if (std.mem.eql(u8, args[1], "multi")) return @import("engine_multi.zig").run(e, a, list.items, new, r0);
+     if (std.mem.eql(u8, args[1], "drafted")) {
+         var bad: usize = 0;
+         // drafted.json: each text's plain tokens and, from the eager arm, how many rows each window kept (1-8)
+diff --git a/zig/src/families/inkling2/engine_multi.zig b/zig/src/families/inkling2/engine_multi.zig
+new file mode 100644
+index 000000000..042bd3def
+--- /dev/null
++++ b/zig/src/families/inkling2/engine_multi.zig
+@@ -0,0 +1,123 @@
++//! tf-inkling2-engine multi: drafted == plain at 1/2/4/8 streams, and Mini's batched pass == the per-stream pass.
++const std = @import("std");
++const ink = @import("inkling2");
++
++const Engine = ink.engine.Engine;
++const Text = struct { name: []const u8, ids: []u32 };
++const Arm = enum { eager, graphed, oracle, sampled };
++
++/// Every arm at 1/2/4/8 streams, depths varied by stream and window (0 too); per-stream and batched drafts must agree.
++pub fn run(e: *Engine, a: std.mem.Allocator, texts: anytype, new: usize, r0: bool) !u8 {
++    var bad: usize = 0;
++    for ([_]Arm{ .eager, .graphed, .oracle, .sampled }) |arm| {
++        const sampled = arm == .sampled;
++        var plains: [8][]u32 = undefined;
++        for (0..8) |i| {
++            e.graphs.settings.on = false;
++            plains[i] = try plain(e, a, texts[i % texts.len].ids, new + 8, if (sampled) rule(i) else null);
++        }
++        for ([_]usize{ 1, 2, 4, 8 }) |k| {
++            e.graphs.settings.on = arm == .graphed or sampled;
++            const orc = if (arm == .oracle) &plains else null;
++            const many = (e.drafter orelse return error.NoDraftHead).many;
++            e.drafter.?.many = null;
++            const old = drafted(e, a, texts, k, new, orc, sampled);
++            e.drafter.?.many = many;
++            const r = try drafted(e, a, texts, k, new, orc, sampled);
++            const ro = try old;
++            var same: usize = 0;
++            for (0..k) |i| same += @intFromBool(std.mem.eql(u32, plains[i][0..new], r.toks[i][0..new]) and std.mem.eql(u32, plains[i][0..new], ro.toks[i][0..new]));
++            const agree = std.mem.eql(u32, ro.log, r.log);
++            const ok = same == k and agree;
++            bad += @intFromBool(!ok);
++            if (r0) std.debug.print("{d} streams {s}: drafted == plain {d}/{d} {s}; batched == per-stream drafts {s} ({d} drafts, {d} passes); accepted {d}/{d}\n", .{ k, @tagName(arm), same, k, if (ok) "PASS" else "FAIL", if (agree) "yes" else "NO", r.log.len, r.passes, r.acc, r.drafted });
++        }
++    }
++    const st = e.graphs.stats;
++    if (r0) std.debug.print("multi: {s}; graphs captured {d}, replayed {d}, eager {d}\n", .{ if (bad == 0) "ALL PASS" else "FAIL", st.captured, st.replayed, st.eager });
++    return if (bad == 0) 0 else 1;
++}
++
++/// Vendor sampling with stream i's own seed: no top-k/top-p cut, so drafts and draws race on each rank's columns.
++fn rule(i: usize) ink.sampler.Sampling {
++    return .{ .seed = 1234 + i, .temperature = 1.0, .top_k = 0, .top_p = 1.0 };
++}
++
++/// One stream's prompt pass on slot 0 then `n` tokens a decode row at a time (greedy, or sampled with `sm`).
++fn plain(e: *Engine, a: std.mem.Allocator, ids: []const u32, n: usize, sm: ?ink.sampler.Sampling) ![]u32 {
++    try e.bind(0);
++    e.begin(sm);
++    var at: usize = 0;
++    var tok: u32 = while (true) : (at += ink.engine.prompt_rows) {
++        if (try e.prefillChunk(ids, at)) |t| break t;
++    };
++    const toks = try a.alloc(u32, n);
++    for (toks) |*x| {
++        x.* = tok;
++        var o: [1]u32 = undefined;
++        try e.verifyShared(&.{.{ .slot = 0, .ids = &.{tok}, .out = &o }});
++        try e.keep(1);
++        tok = o[0];
++    }
++    return toks;
++}
++
++/// k streams on slots 0..k drafting together until each has `n` tokens; `oracle`: plain's tokens, one spoiled.
++fn drafted(e: *Engine, a: std.mem.Allocator, texts: anytype, k: usize, n: usize, oracle: ?*const [8][]u32, sampled: bool) !struct { toks: [8][]u32, log: []u32, passes: usize, acc: usize, drafted: usize } {
++    var log: std.ArrayList(u32) = .empty;
++    var tok: [8]u32 = undefined;
++    var kept: [8]u32 = @splat(0);
++    var toks: [8]std.ArrayList(u32) = @splat(.empty);
++    for (0..k) |i| {
++        try e.bind(@intCast(i));
++        e.begin(if (sampled) rule(i) else null);
++        var at: usize = 0;
++        const ids = texts[i % texts.len].ids;
++        tok[i] = while (true) : (at += ink.engine.prompt_rows) {
++            if (try e.prefillChunk(ids, at)) |t| break t;
++        };
++    }
++    var passes: usize = 0;
++    var acc: usize = 0;
++    var ndrafted: usize = 0;
++    var window: usize = 0;
++    while (true) : (window += 1) {
++        var done = true;
++        for (0..k) |i| done = done and toks[i].items.len >= n;
++        if (done) break;
++        var w: [8][8]u32 = undefined;
++        var depth: [8]usize = undefined;
++        var reqs: [8]ink.engine.Req = undefined;
++        for (0..k) |i| {
++            depth[i] = (i * 3 + window) % 8; // 0..7: some streams draft none
++            w[i][0] = tok[i];
++            reqs[i] = .{ .slot = @intCast(i), .n = kept[i], .anchor = tok[i], .out = w[i][1 .. 1 + depth[i]] };
++        }
++        try e.draftBlock(reqs[0..k]);
++        passes += 1;
++        for (0..k) |i| try log.appendSlice(a, w[i][1 .. 1 + depth[i]]);
++        if (oracle) |orc| for (0..k) |i| {
++            const m = toks[i].items.len;
++            for (1..1 + depth[i]) |j| w[i][j] = orc[i][m + j];
++            if (depth[i] > 0) w[i][1 + window % depth[i]] ^= 1;
++        };
++        var o: [8][8]u32 = undefined;
++        var parts: [8]ink.engine.Part = undefined;
++        for (0..k) |i| parts[i] = .{ .slot = @intCast(i), .ids = w[i][0 .. 1 + depth[i]], .out = o[i][0 .. 1 + depth[i]] };
++        try e.verifyShared(parts[0..k]);
++        for (0..k) |i| {
++            var c: usize = 1;
++            while (c < 1 + depth[i] and w[i][c] == o[i][c - 1]) c += 1;
++            try e.bind(@intCast(i));
++            try e.keep(c);
++            try toks[i].appendSlice(a, w[i][0..c]);
++            acc += c - 1;
++            ndrafted += depth[i];
++            kept[i] = @intCast(c);
++            tok[i] = o[i][c - 1];
++        }
++    }
++    var out: [8][]u32 = undefined;
++    for (0..k) |i| out[i] = toks[i].items;
++    return .{ .toks = out, .log = log.items, .passes = passes, .acc = acc, .drafted = ndrafted };
++}
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 19cb03e2d..505fc8aed 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -37,11 +37,11 @@ const mini_shared_costs = [_]lanes.config.Cost{
+ const mini_pass_ms = 7.0;
+ const mini_stream_ms = 4.0;
+ 
+-/// TF_INKLING2_PLAIN_STREAMS, else 2: shared rounds this wide go plain (drafting them lost 5-10 % at 4-8 streams).
+-pub fn plainStreams() !u32 {
++/// TF_INKLING2_PLAIN_STREAMS, else Small 2 (its per-stream pass lost 5-10 % at 4-8 streams), Mini 0 (batched pass).
++pub fn plainStreams(mini: bool) !u32 {
+     const env = @import("sys").environment;
+     comptime env.registered("TF_INKLING2_PLAIN_STREAMS");
+-    return @intCast(try env.read(u64, "TF_INKLING2_PLAIN_STREAMS", 2));
++    return @intCast(try env.read(u64, "TF_INKLING2_PLAIN_STREAMS", if (mini) 0 else 2));
+ }
+ 
+ /// A stream's place in the backend: its slot, the rows its last window left uncommitted, its first token.
+diff --git a/zig/src/families/inkling2/native.zig b/zig/src/families/inkling2/native.zig
+index de649876e..2da5a6ffd 100644
+--- a/zig/src/families/inkling2/native.zig
++++ b/zig/src/families/inkling2/native.zig
+@@ -175,7 +175,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         std.process.exit(0);
+     }
+     own.link.?.asleep = cuda.tp_watch.open();
+-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link.? }, .plain_streams = try ink_lanes.plainStreams() };
++    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link.? }, .plain_streams = try ink_lanes.plainStreams(own.e.c.loop != null) };
+     if (lim) |l| own.offer = try pictures.Offer.init(gpa, io, l);
+     return .{
+         .backend = own.lanes.backend(),
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 7663c8354..12aab32eb 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -283,6 +283,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_DRAFT_WEIGHTS", .scope = .inkling2, .kind = .word, .trim = " ", .words = &.{ "bf16", "nvfp4" }, .forms = "bf16 or nvfp4 (unset or blank is bf16)" },
+     .{ .name = "TF_INKLING2_PROFILE", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (unset or blank is off)" },
+     .{ .name = "TF_INKLING2_PLAIN_STREAMS", .scope = .inkling2, .kind = .size, .max = 16, .forms = "a whole stream count from 0 to 16 (0: every width drafts; unset: the family's default)" },
++    .{ .name = "TF_INKLING2_DRAFT_BATCH", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (0 puts Mini's draft pass back on the per-stream absorbs and launches; default 1)" },
+ };
+ 
+ /// An alias the server refuses at `version` (semantic versions; a pre-release is before its release), else null.
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index ee1bf9b07..efc96cc78 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -213,6 +213,7 @@ const valid = [_]Case{
+     .{ .name = "TF_INKLING2_DRAFT_WEIGHTS", .raw = "nvfp4", .n = 1 },
+     .{ .name = "TF_INKLING2_PROFILE", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_PLAIN_STREAMS", .raw = "2", .n = 2 },
++    .{ .name = "TF_INKLING2_DRAFT_BATCH", .raw = "0", .n = 0 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
+-- 
+2.53.0
+

@@ -1,0 +1,66 @@
+From 6f995239522e71ee8f3c20f799ffd42611062c80 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:18:20 +1100
+Subject: [PATCH 15/24] inkling2: sampled draws with no cut race on each rank's
+ columns instead of broadcasting whole rows
+
+---
+ zig/src/families/inkling2/engine.zig  | 16 ++++++++++------
+ zig/src/families/inkling2/sampler.zig |  7 +++++++
+ 2 files changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 99a1015dc..13365fe3f 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -424,14 +424,18 @@ pub const Engine = struct {
+         const n = sh.vocab.len();
+         const real = @min(n, @as(usize, e.c.real_vocab) -| sh.vocab.lo);
+         const logits = b.logits.ptr + row0 * n * 4;
+-        if (sm) |s| {
+-            try ops.tobf(&e.m.ops, e.stream, logits, rows, n, real, e.smp.full.ptr, e.smp.vocab, sh.vocab.lo, n);
+-            try e.smp.draw(e.stream, e.exchange, e.spans, rows, first, sampler.rule(s), out);
+-            return e.gathered();
+-        }
+         const stride = pickStride(rows);
+         const vals = e.picks.ptr + sh.rank * stride;
+-        try ops.top1(&e.m.ops, e.stream, logits, rows, n, real, sh.vocab.lo, vals, vals + rows * 4);
++        if (sm) |s| {
++            const r = sampler.rule(s);
++            if (!sampler.raceOnly(r)) {
++                try ops.tobf(&e.m.ops, e.stream, logits, rows, n, real, e.smp.full.ptr, e.smp.vocab, sh.vocab.lo, n);
++                try e.smp.draw(e.stream, e.exchange, e.spans, rows, first, r, out);
++                return e.gathered();
++            }
++            // the keyed race on each rank's columns (row i keys position first + i, as tf_draw), then the best wins
++            for (0..rows) |i| try ops.race1(&e.m.ops, e.stream, logits + i * n * 4, real, sh.vocab.lo, r.seed, r.inv_t, first + i, vals + i * 4, vals + (rows + i) * 4);
++        } else try ops.top1(&e.m.ops, e.stream, logits, rows, n, real, sh.vocab.lo, vals, vals + rows * 4);
+         switch (e.exchange) {
+             .local => {},
+             .nccl => |x| if (x.group) |g| try g.allGather(e.stream, vals, e.picks.ptr, stride) else try x.lib.check(x.lib.api.ncclAllGather(vals, e.picks.ptr, stride, .u8, x.comm, e.stream.handle), "ncclAllGather"),
+diff --git a/zig/src/families/inkling2/sampler.zig b/zig/src/families/inkling2/sampler.zig
+index 7260d85df..40ea62fe6 100644
+--- a/zig/src/families/inkling2/sampler.zig
++++ b/zig/src/families/inkling2/sampler.zig
+@@ -19,6 +19,11 @@ pub fn rule(s: Sampling) Rule {
+     return cuda.sample.rule(s);
+ }
+ 
++/// A rule tf_draw runs as a plain keyed race (no top-k, top-p or min-p cut): each rank races its own columns instead.
++pub fn raceOnly(r: Rule) bool {
++    return r.top_k == 0 and !(r.top_p > 0 and r.top_p < 1) and r.min_log == -std.math.inf(f32);
++}
++
+ pub const Sampler = struct {
+     d: *const cuda.Driver,
+     module: cuda.Module,
+@@ -104,4 +109,6 @@ test "sampler: temperature 0 is greedy, a sampled rule keeps its settings" {
+     try std.testing.expectEqual(@as(f32, 2.0), r.inv_t);
+     try std.testing.expectEqual(@as(u32, 20), r.top_k);
+     try std.testing.expectEqual(@as(?Sampling, null), check(.{ .seed = 0, .temperature = 0 }));
++    try std.testing.expect(!raceOnly(r));
++    try std.testing.expect(raceOnly(rule(.{ .seed = 1, .temperature = 1.0, .top_k = 0, .top_p = 1.0 })));
+ }
+-- 
+2.53.0
+

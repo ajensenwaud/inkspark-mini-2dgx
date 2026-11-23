@@ -1,0 +1,523 @@
+From 6070b98a1187dde23ad0cc40efbff099470cc6b3 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 04:39:30 +1100
+Subject: [PATCH 23/24] inkling2: the batched draft pass under the kernel
+ contract
+
+Each of the six new launches runs the reference and the planted control of
+the kernel it copies, from a one-stream table. Compile records from nvcc
+13.0 on sm_80/86/89/120/121 (later_pending), 13.3 in pending_133.zig; the
+dspark image's twelve older kernels keep their SASS on every SM and both
+compilers.
+---
+ .../core/contract/inkling2_dspark_records.zig |  7 +++
+ .../contract/measurements/pending_133.zig     |  6 ++
+ zig/tests/cuda/contract_inkling2_dspark.zig   | 17 +++++
+ .../cuda/contract_inkling2_dspark_attn.zig    | 22 ++++++-
+ .../cuda/contract_inkling2_dspark_head.zig    | 27 ++++++--
+ .../cuda/contract_inkling2_dspark_norm.zig    | 28 +++++++--
+ zig/tests/cuda/contract_inkling2_ops_pick.zig | 62 +++++++++++++++----
+ 7 files changed, 144 insertions(+), 25 deletions(-)
+
+diff --git a/zig/src/core/contract/inkling2_dspark_records.zig b/zig/src/core/contract/inkling2_dspark_records.zig
+index 571a116bd..2cc174b71 100644
+--- a/zig/src/core/contract/inkling2_dspark_records.zig
++++ b/zig/src/core/contract/inkling2_dspark_records.zig
+@@ -16,6 +16,13 @@ pub const cuda = [_]registry.CudaRecord{
+     // the streams' batched walk (13.0; 13.2 pending, 13.3 in measurements/pending_133.zig)
+     .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_vocab_rows", .symbol = "tf_ink2_dsp_vocab_rows", .image = "inkling2_dspark", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 33, .static = 0, .bound = 256 }, .{ .regs = 33, .static = 0, .bound = 256 } }, .later_pending = true },
+     .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_pick_rows", .symbol = "tf_ink2_dsp_pick_rows", .image = "inkling2_dspark", .threads = 32, .min_sm = 80 }, .usage = .{ .{ .regs = 29, .static = 0, .bound = 0 }, .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 34, .static = 0, .bound = 0 }, .{ .regs = 34, .static = 0, .bound = 0 } }, .later_pending = true },
++    // Mini's batched pass, every stream in one launch (13.0; 13.2 pending, 13.3 in measurements/pending_133.zig)
++    .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_qk_many", .symbol = "tf_ink2_dsp_qk_many", .image = "inkling2_dspark", .threads = 64, .min_sm = 80 }, .usage = .{ .{ .regs = 32, .static = 128, .bound = 64 }, .{ .regs = 30, .static = 128, .bound = 64 }, .{ .regs = 30, .static = 128, .bound = 64 }, .{ .regs = 32, .static = 128, .bound = 64 }, .{ .regs = 34, .static = 128, .bound = 64 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_attn_many", .symbol = "tf_ink2_dsp_attn_many", .image = "inkling2_dspark", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 75, .static = 48192, .bound = 256 }, .{ .regs = 76, .static = 48192, .bound = 256 }, .{ .regs = 76, .static = 48192, .bound = 256 }, .{ .regs = 57, .static = 48192, .bound = 256 }, .{ .regs = 57, .static = 48192, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_merge_many", .symbol = "tf_ink2_dsp_merge_many", .image = "inkling2_dspark", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 128 }, .{ .regs = 36, .static = 0, .bound = 128 }, .{ .regs = 36, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_ctx_many", .symbol = "tf_ink2_dsp_ctx_many", .image = "inkling2_dspark", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 48, .static = 0, .bound = 256 }, .{ .regs = 48, .static = 0, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_rnn_many", .symbol = "tf_ink2_dsp_rnn_many", .image = "inkling2_dspark", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 40, .static = 5120, .bound = 256 }, .{ .regs = 40, .static = 5120, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_pick_many", .symbol = "tf_ink2_dsp_pick_many", .image = "inkling2_dspark", .threads = 1024, .min_sm = 80 }, .usage = .{ .{ .regs = 23, .static = 256, .bound = 1024 }, .{ .regs = 24, .static = 256, .bound = 1024 }, .{ .regs = 24, .static = 256, .bound = 1024 }, .{ .regs = 25, .static = 256, .bound = 1024 }, .{ .regs = 25, .static = 256, .bound = 1024 } }, .later_pending = true },
+ };
+ /// nvcc 13.2's, where it differs: none measured (no 13.2 compiler on the fleet).
+ pub const cuda_132 = [_]registry.Override{};
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index 9fb66ce55..685810753 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -92,4 +92,10 @@ pub const records = [_]Override{
+     .{ .name = "exl3_linear tf_exl3_rot_group5", .usage = .{ .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 } } },
+     .{ .name = "inkling2 dspark tf_ink2_dsp_vocab_rows", .usage = .{ .{ .regs = 32, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 33, .static = 0, .bound = 256 }, .{ .regs = 33, .static = 0, .bound = 256 } } },
+     .{ .name = "inkling2 dspark tf_ink2_dsp_pick_rows", .usage = .{ .{ .regs = 29, .static = 0, .bound = 0 }, .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
++    .{ .name = "inkling2 dspark tf_ink2_dsp_qk_many", .usage = .{ .{ .regs = 32, .static = 128, .bound = 64 }, .{ .regs = 30, .static = 128, .bound = 64 }, .{ .regs = 30, .static = 128, .bound = 64 }, .{ .regs = 32, .static = 128, .bound = 64 }, .{ .regs = 32, .static = 128, .bound = 64 } } },
++    .{ .name = "inkling2 dspark tf_ink2_dsp_attn_many", .usage = .{ .{ .regs = 75, .static = 48192, .bound = 256 }, .{ .regs = 76, .static = 48192, .bound = 256 }, .{ .regs = 76, .static = 48192, .bound = 256 }, .{ .regs = 58, .static = 48192, .bound = 256 }, .{ .regs = 58, .static = 48192, .bound = 256 } } },
++    .{ .name = "inkling2 dspark tf_ink2_dsp_merge_many", .usage = .{ .{ .regs = 32, .static = 0, .bound = 128 }, .{ .regs = 36, .static = 0, .bound = 128 }, .{ .regs = 36, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 } } },
++    .{ .name = "inkling2 dspark tf_ink2_dsp_ctx_many", .usage = .{ .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 40, .static = 0, .bound = 256 }, .{ .regs = 48, .static = 0, .bound = 256 }, .{ .regs = 48, .static = 0, .bound = 256 } } },
++    .{ .name = "inkling2 dspark tf_ink2_dsp_rnn_many", .usage = .{ .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 } } },
++    .{ .name = "inkling2 dspark tf_ink2_dsp_pick_many", .usage = .{ .{ .regs = 23, .static = 256, .bound = 1024 }, .{ .regs = 24, .static = 256, .bound = 1024 }, .{ .regs = 24, .static = 256, .bound = 1024 }, .{ .regs = 25, .static = 256, .bound = 1024 }, .{ .regs = 25, .static = 256, .bound = 1024 } } },
+ };
+diff --git a/zig/tests/cuda/contract_inkling2_dspark.zig b/zig/tests/cuda/contract_inkling2_dspark.zig
+index ff39023fe..4d6b31278 100644
+--- a/zig/tests/cuda/contract_inkling2_dspark.zig
++++ b/zig/tests/cuda/contract_inkling2_dspark.zig
+@@ -9,6 +9,8 @@ const norm = @import("contract_inkling2_dspark_norm.zig");
+ const attn = @import("contract_inkling2_dspark_attn.zig");
+ const head = @import("contract_inkling2_dspark_head.zig");
+ const glue = @import("contract_inkling2_dspark_glue.zig");
++const pick = @import("contract_inkling2_ops_pick.zig");
++const opsref = @import("contract_inkling2_ops_ref.zig");
+ 
+ /// The drafter's registrations, each control after the kernel it breaks (the caller's heap set holds them).
+ pub const Set = struct {
+@@ -23,6 +25,13 @@ pub const Set = struct {
+     rnns: [2]ref.Gated(head.Rnn) = undefined,
+     vocabs: [4]head.Banded(head.Vocab) = undefined,
+     picks: [4]ref.Checked(glue.Pick) = undefined,
++    // Mini's batched pass (dspark_many.cuh), each with the control of the kernel it copies
++    qkms: [3]ref.Gated(norm.Qk) = undefined,
++    attms: [2]attn.Attend = undefined,
++    ctxms: [2]ref.Gated(head.Ctx) = undefined,
++    rnnms: [2]ref.Gated(head.Rnn) = undefined,
++    top1ms: [2]opsref.Checked(pick.Top1) = undefined,
++    racems: [2]opsref.Checked(pick.Race) = undefined,
+ 
+     pub fn init(set: *Set, gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
+         set.k = try dk.Kernels.load(gpu.d);
+@@ -39,6 +48,12 @@ pub const Set = struct {
+         for (&set.rnns, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .late = i == 1 } };
+         for (&set.vocabs, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .short = i % 2 == 1, .rows = i >= 2 } } };
+         for (&set.picks, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .alone = i % 2 == 1, .rows = i >= 2 } };
++        for (&set.qkms, [_]norm.Form{ .draft, .absorb, .draft }, 0..) |*x, f, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .form = f, .late = i == 2, .many = true } };
++        for (&set.attms, 0..) |*x, i| x.* = .{ .rig = rig, .k = k, .late = i == 1, .many = true };
++        for (&set.ctxms, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .early = i == 1, .many = true } };
++        for (&set.rnnms, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .late = i == 1, .many = true } };
++        for (&set.top1ms, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = undefined, .short = i == 1, .many = k } };
++        for (&set.racems, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = undefined, .late = i == 1, .many = k } };
+         for (&set.mixes) |*x| try list.append(a, x.kernel());
+         for (&set.adds) |*x| try list.append(a, x.kernel());
+         for (&set.qks) |*x| try list.append(a, x.kernel());
+@@ -49,6 +64,7 @@ pub const Set = struct {
+         for (&set.rnns) |*x| try list.append(a, x.kernel());
+         for (&set.vocabs) |*x| try list.append(a, x.kernel());
+         for (&set.picks) |*x| try list.append(a, x.kernel());
++        inline for (.{ "qkms", "attms", "ctxms", "rnnms", "top1ms", "racems" }) |f| for (&@field(set, f)) |*x| try list.append(a, x.kernel());
+     }
+ 
+     pub fn deinit(set: *Set) void {
+@@ -62,6 +78,7 @@ pub const Set = struct {
+         for (&set.rnns) |*x| x.deinit();
+         for (&set.vocabs) |*x| x.deinit();
+         for (&set.picks) |*x| x.deinit();
++        inline for (.{ "qkms", "attms", "ctxms", "rnnms", "top1ms", "racems" }) |f| for (&@field(set, f)) |*x| x.deinit();
+         set.k.unload();
+     }
+ };
+diff --git a/zig/tests/cuda/contract_inkling2_dspark_attn.zig b/zig/tests/cuda/contract_inkling2_dspark_attn.zig
+index 1978055be..6e2a29bf3 100644
+--- a/zig/tests/cuda/contract_inkling2_dspark_attn.zig
++++ b/zig/tests/cuda/contract_inkling2_dspark_attn.zig
+@@ -26,9 +26,11 @@ fn attnDepth(s: c.Shape) usize {
+ }
+ 
+ /// T rows x 24 heads x 128 dims x the keys every row sees: a first block, a sliding window, a global prefix, 1M's edge.
+-pub fn attnSpec(late: bool) c.Spec {
++pub fn attnSpec(late: bool, many: bool) c.Spec {
+     const served = &[_]c.Shape{ .{ .rows = T, .n = hq * D, .k = 8 }, .{ .rows = T, .n = hq * D, .k = 1032 }, .{ .rows = T, .n = hq * D, .k = 3000 }, .{ .rows = T, .n = hq * D, .k = 2500 } };
+-    const name = if (late) "inkling2 dspark control: block attention starts a key late" else "inkling2 dspark tf_ink2_dsp_attn + tf_ink2_dsp_merge (a block over keys [lo, hi])";
++    const one = if (late) "inkling2 dspark control: block attention starts a key late" else "inkling2 dspark tf_ink2_dsp_attn + tf_ink2_dsp_merge (a block over keys [lo, hi])";
++    const batched = if (late) "inkling2 dspark control: tf_ink2_dsp_attn_many starts a key late" else "inkling2 dspark tf_ink2_dsp_attn_many + tf_ink2_dsp_merge_many (a stream's block from the table)";
++    const name = if (many) batched else one;
+     return .{ .name = name, .accum = .f32, .depth = attnDepth, .ops = 8, .out = .bf16, .served = served, .sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = soft_why } };
+ }
+ 
+@@ -49,6 +51,9 @@ pub const Attend = struct {
+     k: *const dk.Kernels,
+     /// control: the window starts one key late on the device (the reference keeps its first key)
+     late: bool = false,
++    /// tf_ink2_dsp_attn_many + tf_ink2_dsp_merge_many: one stream's block, its window and caches from a table
++    many: bool = false,
++    tab: u64 = 0,
+     shape: c.Shape = undefined,
+     win: Window = undefined,
+     q: []u16 = &.{},
+@@ -76,7 +81,7 @@ pub const Attend = struct {
+     }
+ 
+     pub fn kernel(self: *Attend) g.Kernel {
+-        return .{ .spec = attnSpec(self.late), .ctx = self, .vt = &vt, .control = if (self.late) .shapes else null };
++        return .{ .spec = attnSpec(self.late, self.many), .ctx = self, .vt = &vt, .control = if (self.late) .shapes else null };
+     }
+ 
+     const vt = g.hooks(Attend);
+@@ -107,6 +112,13 @@ pub const Attend = struct {
+         self.po = try self.rig.scratch(n * shape.rows * hq * D * 4);
+         self.pml = try self.rig.scratch(n * shape.rows * hq * 2 * 4);
+         self.out = try self.rig.output(shape.rows * hq * D * 2);
++        if (self.many) {
++            var st: dk.Stream = .{ .p = @intCast(self.win.hi + 1 - shape.rows) };
++            st.kc[0] = self.in[1];
++            st.vc[0] = self.in[2];
++            st.lo[0] = @intCast(self.win.lo + @intFromBool(self.late));
++            self.tab = try self.rig.input(std.mem.asBytes(&st));
++        }
+         return true;
+     }
+ 
+@@ -117,6 +129,10 @@ pub const Attend = struct {
+ 
+     pub fn run(self: *Attend) !void {
+         const w = self.win;
++        if (self.many) {
++            try dk.attendMany(self.k, self.rig.s, .{ .q = self.in[0], .kc = 0, .vc = 0, .po = self.po, .pml = self.pml, .T = @intCast(self.shape.rows), .hq = hq, .hk = hk, .ring = @intCast(w.ring), .lo = 0, .hi = 0, .c0 = 0, .scale = scale }, self.tab, 0, 1, dk.chunks(w.lo, w.hi), self.out);
++            return self.rig.s.synchronize();
++        }
+         try dk.attend(self.k, self.rig.s, .{ .q = self.in[0], .kc = self.in[1], .vc = self.in[2], .po = self.po, .pml = self.pml, .T = @intCast(self.shape.rows), .hq = hq, .hk = hk, .ring = @intCast(w.ring), .lo = @intCast(w.lo + @intFromBool(self.late)), .hi = @intCast(w.hi), .c0 = 0, .scale = scale }, self.out);
+         try self.rig.s.synchronize();
+     }
+diff --git a/zig/tests/cuda/contract_inkling2_dspark_head.zig b/zig/tests/cuda/contract_inkling2_dspark_head.zig
+index 6936dd3f8..fe1ae4628 100644
+--- a/zig/tests/cuda/contract_inkling2_dspark_head.zig
++++ b/zig/tests/cuda/contract_inkling2_dspark_head.zig
+@@ -80,9 +80,11 @@ fn ctxDepth(s: c.Shape) usize {
+ }
+ 
+ /// Rows (a block's 7 drafting rows) x 3R outputs x 2 hidden inputs: rnn_proj's last columns on [hidden_row, f_rnn].
+-pub fn ctxSpec(early: bool) c.Spec {
++pub fn ctxSpec(early: bool, many: bool) c.Spec {
+     const served = &[_]c.Shape{ .{ .rows = 7, .n = 3 * R, .k = 2 * hidden }, .{ .rows = 1, .n = 3 * R, .k = 2 * hidden }, .{ .rows = 8, .n = 3 * R, .k = 2 * hidden } };
+-    const name = if (early) "inkling2 dspark control: the Markov context reads rnn_proj from column 0" else "inkling2 dspark tf_ink2_dsp_ctx (bias + rnn_proj[:, 2R:] . [hidden, f_rnn])";
++    const one = if (early) "inkling2 dspark control: the Markov context reads rnn_proj from column 0" else "inkling2 dspark tf_ink2_dsp_ctx (bias + rnn_proj[:, 2R:] . [hidden, f_rnn])";
++    const batched = if (early) "inkling2 dspark control: tf_ink2_dsp_ctx_many reads rnn_proj from column 0" else "inkling2 dspark tf_ink2_dsp_ctx_many (a stream's context, its f_rnn from the table)";
++    const name = if (many) batched else one;
+     return .{ .name = name, .accum = .f32, .depth = ctxDepth, .out = .f32, .served = served, .sums = .{} };
+ }
+ 
+@@ -90,6 +92,9 @@ pub const Ctx = struct {
+     kern: *const dk.Kernels,
+     /// control: the device's weight pointer 2R columns early, so it reads rnn_proj[:, 0:2C]
+     early: bool = false,
++    /// tf_ink2_dsp_ctx_many: one stream, its f_rnn read from a stream table
++    many: bool = false,
++    tab: u64 = 0,
+     shape: c.Shape = undefined,
+     h: []u16 = &.{},
+     frnn: []u16 = &.{},
+@@ -101,7 +106,7 @@ pub const Ctx = struct {
+     pub const sums = {};
+ 
+     pub fn spec(self: *const Ctx) c.Spec {
+-        return ctxSpec(self.early);
++        return ctxSpec(self.early, self.many);
+     }
+ 
+     pub fn control(self: *const Ctx) ?g.Gate {
+@@ -145,11 +150,13 @@ pub const Ctx = struct {
+         }
+         self.in = .{ try ref.input(rig, self.h), try ref.input(rig, self.frnn), try ref.input(rig, self.w), try ref.input(rig, self.bias) };
+         self.out = try rig.output(rows * 3 * R * 4);
++        if (self.many) self.tab = try rig.input(std.mem.asBytes(&dk.Stream{ .frnn = self.in[1] }));
+         return true;
+     }
+ 
+     pub fn run(self: *Ctx, rig: *rig_.Rig) !void {
+         const w = self.in[2] - @as(u64, if (self.early) 2 * R * 2 else 0);
++        if (self.many) return dk.ctxMany(self.kern, rig.s, self.in[0], 0, self.tab, w, self.in[3], self.out, 1, self.shape.rows, hidden, R);
+         try dk.ctx(self.kern, rig.s, self.in[0], self.in[1], w, self.in[3], self.out, self.shape.rows, hidden, R);
+     }
+ 
+@@ -177,9 +184,11 @@ fn rnnDepth(_: c.Shape) usize {
+ }
+ 
+ /// Steps (one launch each, the state carried) x R x 2R: one step (gate 4's exact sums), a block's 7.
+-pub fn rnnSpec(late: bool) c.Spec {
++pub fn rnnSpec(late: bool, many: bool) c.Spec {
+     const served = &[_]c.Shape{ .{ .rows = 1, .n = R, .k = 2 * R }, .{ .rows = 7, .n = R, .k = 2 * R } };
+-    const name = if (late) "inkling2 dspark control: the recurrence reads the walk one pick late" else "inkling2 dspark tf_ink2_dsp_rnn (a GRU-style step at the bf16 points)";
++    const one = if (late) "inkling2 dspark control: the recurrence reads the walk one pick late" else "inkling2 dspark tf_ink2_dsp_rnn (a GRU-style step at the bf16 points)";
++    const batched = if (late) "inkling2 dspark control: tf_ink2_dsp_rnn_many reads the walk one pick late" else "inkling2 dspark tf_ink2_dsp_rnn_many (a stream's step, a block a stream)";
++    const name = if (many) batched else one;
+     return .{ .name = name, .accum = .f32, .depth = rnnDepth, .out = .bf16, .in_place = true, .served = served, .sums = .{} };
+ }
+ 
+@@ -188,6 +197,8 @@ pub const Rnn = struct {
+     kern: *const dk.Kernels,
+     /// control: launched on the walk one entry on, so each step reads the next pick's w1 row
+     late: bool = false,
++    /// tf_ink2_dsp_rnn_many: one stream a launch, as the batched pass launches it
++    many: bool = false,
+     shape: c.Shape = undefined,
+     ctx: []f32 = &.{},
+     w: []u16 = &.{},
+@@ -201,7 +212,7 @@ pub const Rnn = struct {
+     pub const sums = {};
+ 
+     pub fn spec(self: *const Rnn) c.Spec {
+-        return rnnSpec(self.late);
++        return rnnSpec(self.late, self.many);
+     }
+ 
+     pub fn control(self: *const Rnn) ?g.Gate {
+@@ -255,6 +266,10 @@ pub const Rnn = struct {
+     pub fn run(self: *Rnn, rig: *rig_.Rig) !void {
+         try ref.restore(rig, self.st, std.mem.sliceAsBytes(self.state)); // read and written in place: every run the same pass
+         const walk = self.in[3] + @as(u64, @intFromBool(self.late)) * 4;
++        if (self.many) {
++            for (0..self.shape.rows) |j| try dk.rnnMany(self.kern, rig.s, self.in[0] + j * 3 * R * 4, 0, self.in[1], self.in[2], walk, 0, j, self.st, self.out + j * R * 2, 1, R, hidden);
++            return;
++        }
+         for (0..self.shape.rows) |j| try dk.rnn(self.kern, rig.s, self.in[0] + j * 3 * R * 4, self.in[1], self.in[2], walk, j, self.st, self.out + j * R * 2, R, hidden);
+     }
+ 
+diff --git a/zig/tests/cuda/contract_inkling2_dspark_norm.zig b/zig/tests/cuda/contract_inkling2_dspark_norm.zig
+index daef29cea..5700674df 100644
+--- a/zig/tests/cuda/contract_inkling2_dspark_norm.zig
++++ b/zig/tests/cuda/contract_inkling2_dspark_norm.zig
+@@ -285,18 +285,24 @@ const dw = width(.draft);
+ const aw = width(.absorb);
+ const draft_served = [_]c.Shape{ .{ .rows = 8, .n = dw, .k = 3007 }, .{ .rows = 8, .n = dw, .k = 70_008 }, .{ .rows = 8, .n = dw, .k = 1_048_576 }, .{ .rows = 8, .n = dw, .k = 8 } };
+ const absorb_served = [_]c.Shape{ .{ .rows = 16, .n = aw, .k = 2016 }, .{ .rows = 2048, .n = aw, .k = 4096 }, .{ .rows = 2048, .n = aw, .k = 1_048_576 }, .{ .rows = 1, .n = aw, .k = 70_001 } };
++/// The batched pass's absorbs: up to 16 streams' kept rows (7 each at most past the anchor) in one launch.
++const absorb_many = [_]c.Shape{ .{ .rows = 16, .n = aw, .k = 2016 }, .{ .rows = 112, .n = aw, .k = 4096 }, .{ .rows = 56, .n = aw, .k = 1_048_576 }, .{ .rows = 1, .n = aw, .k = 70_001 } };
+ 
+ /// Rows x the row's heads x the call's end position (pos0 + rows): early, deep in a ring, and at the 1M edge.
+-pub fn qkSpec(f: Form, late: bool) c.Spec {
++pub fn qkSpec(f: Form, late: bool, many: bool) c.Spec {
+     const served: []const c.Shape = switch (f) {
+         .draft => &draft_served,
+-        .absorb => &absorb_served,
++        .absorb => if (many) &absorb_many else &absorb_served,
+     };
+     const name = if (late) "inkling2 dspark control: q/k prep rotates its rows one position late" else switch (f) {
+         .draft => "inkling2 dspark tf_ink2_dsp_qk, a draft block's q, k, v",
+         .absorb => "inkling2 dspark tf_ink2_dsp_qk, an absorb's context k, v",
+     };
+-    return .{ .name = name, .accum = .f32, .depth = headDepth, .out = .bf16, .served = served, .sums = .{} };
++    const batched = if (late) "inkling2 dspark control: tf_ink2_dsp_qk_many rotates its rows one position late" else switch (f) {
++        .draft => "inkling2 dspark tf_ink2_dsp_qk_many, every stream's block q, k, v",
++        .absorb => "inkling2 dspark tf_ink2_dsp_qk_many, every stream's absorbed k, v",
++    };
++    return .{ .name = if (many) batched else name, .accum = .f32, .depth = headDepth, .out = .bf16, .served = served, .sums = .{} };
+ }
+ 
+ /// Per (row, head): RMSNorm * w rounded to bf16, then neox RoPE at pos0 + row; key and value heads to the caches.
+@@ -305,6 +311,9 @@ pub const Qk = struct {
+     form: Form,
+     /// control: the device rotates every row one position late (its cache rows land where they are due)
+     late: bool = false,
++    /// tf_ink2_dsp_qk_many: the rows' positions and the caches from a one-stream table
++    many: bool = false,
++    tabs: [2]u64 = @splat(0),
+     shape: c.Shape = undefined,
+     pos: usize = 0,
+     x: []u16 = &.{},
+@@ -315,7 +324,7 @@ pub const Qk = struct {
+     pub const sums = {};
+ 
+     pub fn spec(self: *const Qk) c.Spec {
+-        return qkSpec(self.form, self.late);
++        return qkSpec(self.form, self.late, self.many);
+     }
+ 
+     pub fn control(self: *const Qk) ?g.Gate {
+@@ -334,7 +343,7 @@ pub const Qk = struct {
+     /// Heads in [-2, 2) (one in 64 ten times larger); stress: integers in [-64, 64] (the squares pass 2^16).
+     pub fn prepare(self: *Qk, a: std.mem.Allocator, rig: *rig_.Rig, shape: c.Shape, fill: g.Fill, rng: std.Random) !bool {
+         const wd = width(self.form);
+-        if (shape.n != wd or shape.rows == 0 or shape.k < shape.rows) return false;
++        if (shape.n != wd or shape.rows == 0 or shape.k < shape.rows or (self.many and shape.rows > 128)) return false;
+         const ring = ringOf(shape.k);
+         self.pos = shape.k - shape.rows;
+         const shift: usize = @intFromBool(self.late);
+@@ -356,12 +365,21 @@ pub const Qk = struct {
+         self.outs[0] = if (hq > 0) try rig.output(rows * hq * D * 2) else 0;
+         self.outs[1] = try rig.output(rows * kv_heads * D * 2) - slot * kv_heads * D * 2;
+         self.outs[2] = try rig.output(rows * kv_heads * D * 2) - slot * kv_heads * D * 2;
++        if (self.many) {
++            var st: dk.Stream = .{};
++            st.kc[0] = self.outs[1];
++            st.vc[0] = self.outs[2];
++            var at: [128][2]i32 = undefined;
++            for (at[0..rows], 0..) |*x, r| x.* = .{ 0, @intCast(self.pos + shift + r) };
++            self.tabs = .{ try rig.input(std.mem.asBytes(&st)), try rig.input(std.mem.sliceAsBytes(at[0..rows])) };
++        }
+         return true;
+     }
+ 
+     pub fn run(self: *Qk, rig: *rig_.Rig) !void {
+         const hq = qHeads(self.form);
+         const d = self.dev;
++        if (self.many) return dk.qkMany(self.kern, rig.s, .{ .x = d[0], .qw = if (hq > 0) d[1] else 0, .kw = d[2], .q = self.outs[0], .kc = 0, .vc = 0, .ld = @intCast(width(self.form)), .hq = @intCast(hq), .hk = kv_heads, .ring = @intCast(ringOf(self.shape.k)), .pos0 = 0, .eps = eps, .theta = theta }, self.tabs[0], self.tabs[1], 0, self.shape.rows);
+         try dk.qk(self.kern, rig.s, .{ .x = d[0], .qw = if (hq > 0) d[1] else 0, .kw = d[2], .q = self.outs[0], .kc = self.outs[1], .vc = self.outs[2], .ld = @intCast(width(self.form)), .hq = @intCast(hq), .hk = kv_heads, .ring = @intCast(ringOf(self.shape.k)), .pos0 = @intCast(self.pos + @intFromBool(self.late)), .eps = eps, .theta = theta }, self.shape.rows);
+     }
+ 
+diff --git a/zig/tests/cuda/contract_inkling2_ops_pick.zig b/zig/tests/cuda/contract_inkling2_ops_pick.zig
+index 28564cb37..ad6436afe 100644
+--- a/zig/tests/cuda/contract_inkling2_ops_pick.zig
++++ b/zig/tests/cuda/contract_inkling2_ops_pick.zig
+@@ -7,6 +7,7 @@ const ref = @import("contract_inkling2_ops_ref.zig");
+ const c = core.contract.spec;
+ const g = core.contract.gates;
+ const ops = ref.ops;
++const dk = @import("inkling2").dspark_ops;
+ 
+ /// A rank's view of the head (shape.k: 1 rank 0, 2 rank 1): its first id, its rows' stride, the real ids it holds.
+ const Rank = struct { base: usize, stride: usize, n: usize };
+@@ -20,11 +21,27 @@ const ranks = [_]c.Shape{ .{ .rows = 16, .n = ref.share, .k = 1 }, .{ .rows = 1,
+ const top_rule = "the largest value and its lowest id plus the rank's base; a NaN never picked, -inf picked when all else is NaN, a row of NaNs (-inf, base)";
+ 
+ /// Rows x a rank's real ids x the rank: greedy draws of a window's rows, the drafter's single row.
+-pub fn top1Spec(short: bool) c.Spec {
++pub fn top1Spec(short: bool, many: bool) c.Spec {
+     const name = if (short) "control: inkling2 ops tf_ink2_top1 one id short" else "inkling2 ops tf_ink2_top1 (greedy pick, fp32 logits)";
++    if (many) {
++        const m = if (short) "inkling2 dspark control: tf_ink2_dsp_pick_many greedy one id short" else "inkling2 dspark tf_ink2_dsp_pick_many, greedy (a stream's step pick a block)";
++        return .{ .name = m, .accum = .none, .depth = ref.noSums, .out = .raw, .nan = .{ .stated = top_rule }, .served = ranks[0..3] };
++    }
+     return .{ .name = name, .accum = .none, .depth = ref.noSums, .out = .raw, .nan = .{ .stated = top_rule }, .served = if (short) ranks[0..2] else &ranks };
+ }
+ 
++/// The batched pass's picks: a stream table (raced or not) and each row's (value, id) 16 bytes apart.
++fn manyTable(rig: *rig_.Rig, rows: usize, race: bool, late: bool) !u64 {
++    var st: [128]dk.Stream = @splat(.{});
++    for (st[0..rows], 0..) |*x, r| x.* = .{ .race = @intFromBool(race), .seed = seed, .inv_t = inv_t, .p = @intCast(pos0 + r + @intFromBool(late) - 1) };
++    return rig.input(std.mem.sliceAsBytes(st[0..rows]));
++}
++
++/// Where row r's value and id sit in the output: two arrays, or (value, id) 16 bytes apart (the batched pick).
++fn slots(many: bool, rows: usize, r: usize) [2]usize {
++    return if (many) .{ 4 * r, 4 * r + 1 } else .{ r, rows + r };
++}
++
+ /// Values on 1/8 steps of [-64, 64) and padding past the real ids at 1000: equal maxima, and a read past n shows.
+ fn logits(a: std.mem.Allocator, rng: std.Random, s: c.Shape, fill: g.Fill) ![]f32 {
+     const rk = rank(s);
+@@ -63,13 +80,16 @@ fn scan(row: []const f32) struct { v: f32, i: usize } {
+ pub const Top1 = struct {
+     kern: *const ops.Kernels,
+     short: bool = false,
++    /// tf_ink2_dsp_pick_many over greedy streams (its kernels)
++    many: ?*const dk.Kernels = null,
+     shape: c.Shape = undefined,
+     x: []f32 = &.{},
+     dev: u64 = 0,
++    tab: u64 = 0,
+     out: [2]u64 = @splat(0),
+ 
+     pub fn spec(self: *const Top1) c.Spec {
+-        return top1Spec(self.short);
++        return top1Spec(self.short, self.many != null);
+     }
+ 
+     pub fn control(self: *const Top1) ?g.Gate {
+@@ -83,21 +103,28 @@ pub const Top1 = struct {
+ 
+     pub fn prepare(self: *Top1, a: std.mem.Allocator, rig: *rig_.Rig, shape: c.Shape, fill: g.Fill, rng: std.Random) !bool {
+         if (shape.rows == 0 or shape.n < 4 or shape.n > ref.share) return false;
++        if (self.many != null and (shape.k != 1 or shape.rows > 128)) return false;
+         self.free(a);
+         self.shape = shape;
+         self.x = try logits(a, rng, shape, fill);
+         self.dev = try ref.input(rig, self.x);
++        if (self.many != null) {
++            self.tab = try manyTable(rig, shape.rows, false, false);
++            self.out = .{ try rig.output(shape.rows * 16), 0 };
++            return true;
++        }
+         self.out = .{ try rig.output(shape.rows * 4), try rig.output(shape.rows * 4) };
+         return true;
+     }
+ 
+     pub fn run(self: *Top1, rig: *rig_.Rig) !void {
+         const rk = rank(self.shape);
++        if (self.many) |m| return dk.pickMany(m, rig.s, self.dev, rk.stride - @intFromBool(self.short), rk.n, rk.base, self.tab, 0, self.out[0], self.shape.rows);
+         try ops.top1(self.kern, rig.s, self.dev, self.shape.rows, rk.stride, rk.n - @intFromBool(self.short), rk.base, self.out[0], self.out[1]);
+     }
+ 
+     pub fn count(self: *const Top1) usize {
+-        return self.shape.rows * 8;
++        return self.shape.rows * @as(usize, if (self.many != null) 16 else 8);
+     }
+ 
+     pub fn check(self: *const Top1, _: std.mem.Allocator, got: []const u8, msg: []u8) !?[]const u8 {
+@@ -105,8 +132,9 @@ pub const Top1 = struct {
+         const rows = self.shape.rows;
+         for (0..rows) |r| {
+             const want = scan(self.x[r * rk.stride ..][0..rk.n]);
+-            const v = ref.readF32(got, r);
+-            const i = ref.readI32(got, rows + r);
++            const at = slots(self.many != null, rows, r);
++            const v = ref.readF32(got, at[0]);
++            const i = ref.readI32(got, at[1]);
+             if (v != want.v or i != @as(i32, @intCast(want.i + rk.base))) return try std.fmt.bufPrint(msg, "row {d}: ({e}, {d}) where ({e}, {d}) is due", .{ r, v, i, want.v, want.i + rk.base });
+         }
+         return null;
+@@ -121,8 +149,10 @@ const race_rule = "the largest bf16(x) / T + Gumbel(sample.cu's key at pos, id):
+     "better beyond it; NaN never picked, the lowest +Inf first, a row of NaNs (-inf, base)";
+ 
+ /// One row a launch (the drafter's draw at a position) x a rank's real ids x the rank.
+-pub fn raceSpec(late: bool) c.Spec {
+-    const name = if (late) "control: inkling2 ops tf_ink2_race1 keyed one position late" else "inkling2 ops tf_ink2_race1 (keyed Gumbel race, a launch a row)";
++pub fn raceSpec(late: bool, many: bool) c.Spec {
++    const one = if (late) "control: inkling2 ops tf_ink2_race1 keyed one position late" else "inkling2 ops tf_ink2_race1 (keyed Gumbel race, a launch a row)";
++    const batched = if (late) "inkling2 dspark control: tf_ink2_dsp_pick_many raced one position late" else "inkling2 dspark tf_ink2_dsp_pick_many, raced (each stream's keys from the table)";
++    const name = if (many) batched else one;
+     const served = &[_]c.Shape{ .{ .rows = 4, .n = ref.share, .k = 1 }, .{ .rows = 1, .n = ref.share, .k = 1 }, .{ .rows = 2, .n = ref.share1_real, .k = 2 } };
+     return .{ .name = name, .accum = .none, .depth = ref.noSums, .out = .raw, .nan = .{ .stated = race_rule }, .served = if (late) served[0..2] else served };
+ }
+@@ -149,13 +179,16 @@ fn uniform(pos: u32, id: u32) f32 {
+ pub const Race = struct {
+     kern: *const ops.Kernels,
+     late: bool = false,
++    /// tf_ink2_dsp_pick_many over raced streams (its kernels)
++    many: ?*const dk.Kernels = null,
+     shape: c.Shape = undefined,
+     x: []f32 = &.{},
+     dev: u64 = 0,
++    tab: u64 = 0,
+     out: [2]u64 = @splat(0),
+ 
+     pub fn spec(self: *const Race) c.Spec {
+-        return raceSpec(self.late);
++        return raceSpec(self.late, self.many != null);
+     }
+ 
+     pub fn control(self: *const Race) ?g.Gate {
+@@ -176,12 +209,18 @@ pub const Race = struct {
+             v.* /= 32; // logits within a few Gumbel widths, so the keys decide
+         };
+         self.dev = try ref.input(rig, self.x);
++        if (self.many != null) {
++            self.tab = try manyTable(rig, shape.rows, true, self.late);
++            self.out = .{ try rig.output(shape.rows * 16), 0 };
++            return true;
++        }
+         self.out = .{ try rig.output(shape.rows * 4), try rig.output(shape.rows * 4) };
+         return true;
+     }
+ 
+     pub fn run(self: *Race, rig: *rig_.Rig) !void {
+         const rk = rank(self.shape);
++        if (self.many) |m| return dk.pickMany(m, rig.s, self.dev, rk.stride, rk.n, rk.base, self.tab, 0, self.out[0], self.shape.rows);
+         for (0..self.shape.rows) |r| {
+             const pos = pos0 + r + @intFromBool(self.late);
+             try ops.race1(self.kern, rig.s, self.dev + r * rk.stride * 4, rk.n, rk.base, seed, inv_t, pos, self.out[0] + r * 4, self.out[1] + r * 4);
+@@ -189,7 +228,7 @@ pub const Race = struct {
+     }
+ 
+     pub fn count(self: *const Race) usize {
+-        return self.shape.rows * 8;
++        return self.shape.rows * @as(usize, if (self.many != null) 16 else 8);
+     }
+ 
+     /// The host's score of id i, and its margin: logf's error on both logs, the fp32 roundings around them.
+@@ -206,8 +245,9 @@ pub const Race = struct {
+         for (0..rows) |r| {
+             const row = self.x[r * rk.stride ..][0..rk.n];
+             const pos: u32 = @intCast(pos0 + r);
+-            const v = ref.readF32(got, r);
+-            const id = ref.readI32(got, rows + r) - @as(i32, @intCast(rk.base));
++            const at = slots(self.many != null, rows, r);
++            const v = ref.readF32(got, at[0]);
++            const id = ref.readI32(got, at[1]) - @as(i32, @intCast(rk.base));
+             const top = scan(row);
+             if (top.v == -std.math.inf(f32) and std.math.isNan(row[0])) {
+                 if (id != 0 or v != -std.math.inf(f32)) return try std.fmt.bufPrint(msg, "row {d} of NaNs: ({e}, {d})", .{ r, v, id });
+-- 
+2.53.0
+

@@ -1,0 +1,29 @@
+From 0150a491594b453d2387c8ba9e9f7884d79c4682 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 13:57:24 +1100
+Subject: [PATCH 07/24] native: open CUDA families by every model_type they
+ read
+
+A family's also_model_types (cuda_alias.zig) only reached the HIP host,
+so the CUDA host refused inkling2_loop checkpoints that the inkling2
+family reads.
+---
+ zig/src/native/cuda.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index c1f8294c6..8db81cc5c 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -175,7 +175,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
+         .not_mine => {},
+         .opened => |engine| return engine,
+     }
+-    inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
++    inline for (registry) |F| if (@import("cuda_alias.zig").reads(F, o.model_type)) return openWith(F, a, gpa, io, o, problem);
+     problem.* = try std.fmt.allocPrint(a, "the native CUDA engine has no backend for {s} checkpoints yet", .{o.model_type});
+     return null;
+ }
+-- 
+2.53.0
+

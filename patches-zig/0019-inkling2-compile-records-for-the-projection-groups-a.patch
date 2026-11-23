@@ -1,0 +1,65 @@
+From b3af5bbf08dc13b64f610d32b2a4dc46d1f22536 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:41:15 +1100
+Subject: [PATCH 19/24] inkling2: compile records for the projection groups and
+ the batched draft walk
+
+tf_exl3_group5_{8,10,12}_2_{4,8}, tf_exl3_rot_group5, tf_ink2_dsp_vocab_rows and tf_ink2_dsp_pick_rows: nvcc 13.0 records on sm_80/86/89/120/121 with later_pending set, 13.3 receipts in measurements/pending_133.zig, 13.2 pending.
+---
+ zig/src/core/contract/exl3_dense_records.zig       | 8 ++++++++
+ zig/src/core/contract/inkling2_dspark_records.zig  | 3 +++
+ zig/src/core/contract/measurements/pending_133.zig | 9 +++++++++
+ 3 files changed, 20 insertions(+)
+
+diff --git a/zig/src/core/contract/exl3_dense_records.zig b/zig/src/core/contract/exl3_dense_records.zig
+index c5ab92697..563d44bae 100644
+--- a/zig/src/core/contract/exl3_dense_records.zig
++++ b/zig/src/core/contract/exl3_dense_records.zig
+@@ -74,4 +74,12 @@ pub const cuda = [_]registry.CudaRecord{
+     .{ .launch = .{ .name = "exl3_linear tf_exl3_group_8_2_4", .symbol = "tf_exl3_group_8_2_4", .image = "exl3_linear", .threads = 128, .dynamic = 16384 }, .usage = .{ .{ .regs = 201, .static = 128, .bound = 128 }, .{ .regs = 201, .static = 128, .bound = 128 }, .{ .regs = 201, .static = 128, .bound = 128 }, .{ .regs = 163, .static = 128, .bound = 128 }, .{ .regs = 163, .static = 128, .bound = 128 } } },
+     .{ .launch = .{ .name = "exl3_linear tf_exl3_group_8_2_8", .symbol = "tf_exl3_group_8_2_8", .image = "exl3_linear", .threads = 256, .dynamic = 32768 }, .usage = .{ .{ .regs = 164, .static = 128, .bound = 256 }, .{ .regs = 162, .static = 128, .bound = 256 }, .{ .regs = 162, .static = 128, .bound = 256 }, .{ .regs = 128, .static = 128, .bound = 256 }, .{ .regs = 128, .static = 128, .bound = 256 } } },
+     .{ .launch = .{ .name = "exl3_linear tf_exl3_rot_group", .symbol = "tf_exl3_rot_group", .image = "exl3_linear", .threads = 128 }, .usage = .{ .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 24, .static = 0, .bound = 128 } } },
++    // Inkling 2's visit projection groups (nvcc 13.0; 13.2 pending, 13.3 in measurements/pending_133.zig)
++    .{ .launch = .{ .name = "exl3_linear tf_exl3_group5_8_2_4", .symbol = "tf_exl3_group5_8_2_4", .image = "exl3_linear", .threads = 128, .dynamic = 16384 }, .usage = .{ .{ .regs = 201, .static = 128, .bound = 128 }, .{ .regs = 201, .static = 128, .bound = 128 }, .{ .regs = 201, .static = 128, .bound = 128 }, .{ .regs = 163, .static = 128, .bound = 128 }, .{ .regs = 163, .static = 128, .bound = 128 } }, .later_pending = true },
++    .{ .launch = .{ .name = "exl3_linear tf_exl3_group5_8_2_8", .symbol = "tf_exl3_group5_8_2_8", .image = "exl3_linear", .threads = 256, .dynamic = 32768 }, .usage = .{ .{ .regs = 164, .static = 128, .bound = 256 }, .{ .regs = 164, .static = 128, .bound = 256 }, .{ .regs = 164, .static = 128, .bound = 256 }, .{ .regs = 128, .static = 128, .bound = 256 }, .{ .regs = 128, .static = 128, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "exl3_linear tf_exl3_group5_10_2_4", .symbol = "tf_exl3_group5_10_2_4", .image = "exl3_linear", .threads = 128, .dynamic = 16384 }, .usage = .{ .{ .regs = 194, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 181, .static = 128, .bound = 128 }, .{ .regs = 181, .static = 128, .bound = 128 } }, .later_pending = true },
++    .{ .launch = .{ .name = "exl3_linear tf_exl3_group5_10_2_8", .symbol = "tf_exl3_group5_10_2_8", .image = "exl3_linear", .threads = 256, .dynamic = 32768 }, .usage = .{ .{ .regs = 189, .static = 128, .bound = 256 }, .{ .regs = 185, .static = 128, .bound = 256 }, .{ .regs = 185, .static = 128, .bound = 256 }, .{ .regs = 172, .static = 128, .bound = 256 }, .{ .regs = 172, .static = 128, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "exl3_linear tf_exl3_group5_12_2_4", .symbol = "tf_exl3_group5_12_2_4", .image = "exl3_linear", .threads = 128, .dynamic = 16384 }, .usage = .{ .{ .regs = 194, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 177, .static = 128, .bound = 128 }, .{ .regs = 177, .static = 128, .bound = 128 } }, .later_pending = true },
++    .{ .launch = .{ .name = "exl3_linear tf_exl3_group5_12_2_8", .symbol = "tf_exl3_group5_12_2_8", .image = "exl3_linear", .threads = 256, .dynamic = 32768 }, .usage = .{ .{ .regs = 187, .static = 128, .bound = 256 }, .{ .regs = 187, .static = 128, .bound = 256 }, .{ .regs = 187, .static = 128, .bound = 256 }, .{ .regs = 171, .static = 128, .bound = 256 }, .{ .regs = 171, .static = 128, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "exl3_linear tf_exl3_rot_group5", .symbol = "tf_exl3_rot_group5", .image = "exl3_linear", .threads = 128 }, .usage = .{ .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 } }, .later_pending = true },
+ };
+diff --git a/zig/src/core/contract/inkling2_dspark_records.zig b/zig/src/core/contract/inkling2_dspark_records.zig
+index 904ca0739..571a116bd 100644
+--- a/zig/src/core/contract/inkling2_dspark_records.zig
++++ b/zig/src/core/contract/inkling2_dspark_records.zig
+@@ -13,6 +13,9 @@ pub const cuda = [_]registry.CudaRecord{
+     .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_rnn", .symbol = "tf_ink2_dsp_rnn", .image = "inkling2_dspark", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 32, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 39, .static = 5120, .bound = 256 }, .{ .regs = 40, .static = 5120, .bound = 256 }, .{ .regs = 40, .static = 5120, .bound = 256 } } },
+     .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_vocab", .symbol = "tf_ink2_dsp_vocab", .image = "inkling2_dspark", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 21, .static = 0, .bound = 256 }, .{ .regs = 22, .static = 0, .bound = 256 }, .{ .regs = 22, .static = 0, .bound = 256 }, .{ .regs = 15, .static = 0, .bound = 256 }, .{ .regs = 15, .static = 0, .bound = 256 } } },
+     .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_pick", .symbol = "tf_ink2_dsp_pick", .image = "inkling2_dspark", .threads = 1, .min_sm = 80 }, .usage = .{ .{ .regs = 18, .static = 0, .bound = 0 }, .{ .regs = 18, .static = 0, .bound = 0 }, .{ .regs = 18, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
++    // the streams' batched walk (13.0; 13.2 pending, 13.3 in measurements/pending_133.zig)
++    .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_vocab_rows", .symbol = "tf_ink2_dsp_vocab_rows", .image = "inkling2_dspark", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 33, .static = 0, .bound = 256 }, .{ .regs = 33, .static = 0, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 dspark tf_ink2_dsp_pick_rows", .symbol = "tf_ink2_dsp_pick_rows", .image = "inkling2_dspark", .threads = 32, .min_sm = 80 }, .usage = .{ .{ .regs = 29, .static = 0, .bound = 0 }, .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 34, .static = 0, .bound = 0 }, .{ .regs = 34, .static = 0, .bound = 0 } }, .later_pending = true },
+ };
+ /// nvcc 13.2's, where it differs: none measured (no 13.2 compiler on the fleet).
+ pub const cuda_132 = [_]registry.Override{};
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index 16c9ceec2..268ba3bad 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -85,4 +85,13 @@ pub const records = [_]Override{
+     .{ .name = "inkling2 loop tf_ink2_loop_bank", .usage = .{ .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 } } },
+     .{ .name = "inkling2 loop tf_ink2_loop_rotate", .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 28, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 } } },
+     .{ .name = "inkling2 loop tf_ink2_loop_tail", .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 30, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 23, .static = 0, .bound = 32 }, .{ .regs = 23, .static = 0, .bound = 32 } } },
++    .{ .name = "exl3_linear tf_exl3_group5_8_2_4", .usage = .{ .{ .regs = 195, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 166, .static = 128, .bound = 128 }, .{ .regs = 166, .static = 128, .bound = 128 } } },
++    .{ .name = "exl3_linear tf_exl3_group5_8_2_8", .usage = .{ .{ .regs = 160, .static = 128, .bound = 256 }, .{ .regs = 162, .static = 128, .bound = 256 }, .{ .regs = 162, .static = 128, .bound = 256 }, .{ .regs = 128, .static = 128, .bound = 256 }, .{ .regs = 128, .static = 128, .bound = 256 } } },
++    .{ .name = "exl3_linear tf_exl3_group5_10_2_4", .usage = .{ .{ .regs = 194, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 164, .static = 128, .bound = 128 }, .{ .regs = 164, .static = 128, .bound = 128 } } },
++    .{ .name = "exl3_linear tf_exl3_group5_10_2_8", .usage = .{ .{ .regs = 189, .static = 128, .bound = 256 }, .{ .regs = 185, .static = 128, .bound = 256 }, .{ .regs = 185, .static = 128, .bound = 256 }, .{ .regs = 156, .static = 128, .bound = 256 }, .{ .regs = 156, .static = 128, .bound = 256 } } },
++    .{ .name = "exl3_linear tf_exl3_group5_12_2_4", .usage = .{ .{ .regs = 194, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 196, .static = 128, .bound = 128 }, .{ .regs = 162, .static = 128, .bound = 128 }, .{ .regs = 162, .static = 128, .bound = 128 } } },
++    .{ .name = "exl3_linear tf_exl3_group5_12_2_8", .usage = .{ .{ .regs = 187, .static = 128, .bound = 256 }, .{ .regs = 187, .static = 128, .bound = 256 }, .{ .regs = 187, .static = 128, .bound = 256 }, .{ .regs = 155, .static = 128, .bound = 256 }, .{ .regs = 155, .static = 128, .bound = 256 } } },
++    .{ .name = "exl3_linear tf_exl3_rot_group5", .usage = .{ .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 24, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 }, .{ .regs = 22, .static = 0, .bound = 128 } } },
++    .{ .name = "inkling2 dspark tf_ink2_dsp_vocab_rows", .usage = .{ .{ .regs = 32, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 33, .static = 0, .bound = 256 }, .{ .regs = 33, .static = 0, .bound = 256 } } },
++    .{ .name = "inkling2 dspark tf_ink2_dsp_pick_rows", .usage = .{ .{ .regs = 29, .static = 0, .bound = 0 }, .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 30, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+ };
+-- 
+2.53.0
+

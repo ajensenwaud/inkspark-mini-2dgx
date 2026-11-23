@@ -1,0 +1,1128 @@
+From 053d2bdc5b275f5b316440321f31e71d15367605 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 13:20:11 +1100
+Subject: [PATCH 05/24] inkling2: run Mini's loop in the forward
+
+The forward walks the visit plan instead of the layers: 48 visits for
+Mini, each with its own cache slot (KV rings and conv states), passes 2
+and 3 starting again from the prelude's hidden state and blocks, and the
+previous pass's bank (layer 12's input and its output) feeding the q, k,
+v and MLP message gates on every core visit. A message visit's mixes run
+unnormed (tf_ink2_loop_mix), the gates blend them, and the input norms
+follow (tf_ink2_loop_norm). Cache slots, conv rewind sites and kept
+states count visits; Small's plan is its layers in order, so its slots,
+allocations and launches are unchanged. The server reads inkling2_loop
+configs; Mini's four-tap drafter is not wired yet and is skipped.
+tf-inkling2-cuda takes --zero-messages as the planted control.
+---
+ zig/build/cuda_kernels.zig              |   1 +
+ zig/kernels/cuda/inkling2/loop.cu       |  91 +++++++++++
+ zig/src/cuda/kernels.zig                |   1 +
+ zig/src/families/inkling2/dump_main.zig |  10 +-
+ zig/src/families/inkling2/engine.zig    |  12 +-
+ zig/src/families/inkling2/forward.zig   | 198 +++++++++--------------
+ zig/src/families/inkling2/inkling2.zig  |   5 +
+ zig/src/families/inkling2/kept.zig      |   8 +-
+ zig/src/families/inkling2/loop.zig      | 204 ++++++++++++++++++++++++
+ zig/src/families/inkling2/native.zig    |   2 +
+ zig/src/families/inkling2/shape.zig     |  25 ++-
+ zig/src/families/inkling2/state.zig     | 104 ++++++++++++
+ zig/src/families/inkling2/visits.zig    |  37 +++--
+ zig/src/families/inkling2/weights.zig   |  32 ++++
+ zig/tests/fixtures/gradient-serving.tsv |   2 +-
+ 15 files changed, 585 insertions(+), 147 deletions(-)
+ create mode 100644 zig/src/families/inkling2/loop.zig
+ create mode 100644 zig/src/families/inkling2/state.zig
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 77b3341c0..5e32f9847 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -169,6 +169,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "inkling2_experts", .src = "inkling2/experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // ours: Inkling 2's grouped experts
+     .{ .name = "inkling2_dspark", .src = "inkling2/dspark", .flags = glue }, // ours: Inkling 2's DSpark drafter glue
+     .{ .name = "inkling2_vision", .src = "inkling2/vision", .flags = glue }, // ours: Inkling 2's vision tower glue and attention
++    .{ .name = "inkling2_loop", .src = "inkling2/loop", .flags = glue }, // ours: Inkling 2 Mini's loop messages and gates
+     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
+     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
+     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
+diff --git a/zig/kernels/cuda/inkling2/loop.cu b/zig/kernels/cuda/inkling2/loop.cu
+index 2caad450d..01307ee73 100644
+--- a/zig/kernels/cuda/inkling2/loop.cu
++++ b/zig/kernels/cuda/inkling2/loop.cu
+@@ -292,3 +292,94 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2_loop_blend(
+         }
+     }
+ }
++
++namespace ink2_loop {
++
++constexpr int kMaxBlocks = 8, kMaxQueries = 3, kRowThreads = 512;
++
++__device__ __forceinline__ float bf(uint16_t u) { return __uint_as_float(static_cast<uint32_t>(u) << 16); }
++__device__ __forceinline__ uint16_t tobf(float f) { return __bfloat16_as_ushort(__float2bfloat16_rn(f)); }
++
++// A message visit's residual mix (ops.cu's MixArgs without the norm): fp32 [nq][rows][C] out.
++struct RawMix {
++    const uint16_t* blocks[kMaxBlocks];  // bf16 [rows, C] each: the completed blocks' inputs
++    const void* partial;                 // [rows, C]: bf16 when partial_bf16, else fp32
++    const float* query;                  // fp32 [nq, C]
++    float* out;
++    int n_blocks, partial_bf16, nq, rows, C;
++};
++
++// The weighted RMSNorm after each gate (Inkling2RMSNorm): a weight per gate, bf16 [C] each.
++struct Norms {
++    const uint16_t* w[kMaxQueries];
++};
++
++}  // namespace ink2_loop
++
++// The block attention-residual mix of tf_ink2_mix_rows, same sums in the same order, left unnormed: a block a row.
++extern "C" __global__ void __launch_bounds__(kRowThreads) tf_ink2_loop_mix(const RawMix a) {
++    __shared__ float sh[32];
++    __shared__ float wts[kMaxQueries][kMaxBlocks + 1];
++    __shared__ float rr[kMaxBlocks + 1];
++    const size_t row = blockIdx.x;
++    const int C = a.C, n = a.n_blocks + 1, groups = blockDim.x >> 5;
++    auto entry = [&](int j, int c) -> float {
++        if (j < a.n_blocks) return bf(a.blocks[j][row * C + c]);
++        return a.partial_bf16 ? bf(static_cast<const uint16_t*>(a.partial)[row * C + c])
++                              : static_cast<const float*>(a.partial)[row * C + c];
++    };
++    for (int j = 0; j < n; ++j) {
++        float v[1 + kMaxQueries] = {0.0f, 0.0f, 0.0f, 0.0f};
++        for (int c = threadIdx.x; c < C; c += blockDim.x) {
++            const float x = entry(j, c);
++            v[0] += x * x;
++            for (int q = 0; q < a.nq; ++q) v[1 + q] += x * a.query[static_cast<size_t>(q) * C + c];
++        }
++        for (int q = 0; q < 1 + kMaxQueries; ++q) v[q] = tf_common::block_sum_tree(v[q], sh, groups);
++        const float r = rsqrtf(v[0] / C + 1e-6f);
++        if (threadIdx.x == 0) {
++            rr[j] = r;
++            for (int q = 0; q < a.nq; ++q) wts[q][j] = v[1 + q] * r * rsqrtf(static_cast<float>(C));
++        }
++    }
++    __syncthreads();
++    if (threadIdx.x < a.nq) {
++        float* l = wts[threadIdx.x];
++        float m = -INFINITY, t = 0.0f;
++        for (int j = 0; j < n; ++j) m = fmaxf(m, l[j]);
++        for (int j = 0; j < n; ++j) t += expf(l[j] - m);
++        for (int j = 0; j < n; ++j) l[j] = expf(l[j] - m) / t;
++    }
++    __syncthreads();
++    for (int q = 0; q < a.nq; ++q) {
++        float* o = a.out + (static_cast<size_t>(q) * a.rows + row) * C;
++        for (int c = threadIdx.x; c < C; c += blockDim.x) {
++            float h = 0.0f;
++            for (int j = 0; j < n; ++j) h += wts[q][j] * (entry(j, c) * rr[j]);
++            o[c] = h;
++        }
++    }
++}
++
++// Each gate's fp32 output [rows][gates][C] normed into the bf16 projection inputs [gates][rows][C]: grid (rows, gates).
++extern "C" __global__ void __launch_bounds__(kRowThreads) tf_ink2_loop_norm(const float* __restrict__ x, Norms w,
++                                                                           uint16_t* __restrict__ out, int rows, int C,
++                                                                           float eps) {
++    __shared__ float sh[32];
++    const int row = blockIdx.x, gate = blockIdx.y, gates = gridDim.y;
++    const float* xr = x + (static_cast<size_t>(row) * gates + gate) * C;
++    const uint16_t* wg = gate == 0 ? w.w[0] : gate == 1 ? w.w[1] : w.w[2];
++    float s = 0.0f;
++    for (int c = threadIdx.x; c < C; c += blockDim.x) s += xr[c] * xr[c];
++    s = tf_common::block_sum_tree(s, sh, blockDim.x >> 5);
++    const float r = rsqrtf(s / C + eps);
++    uint16_t* o = out + (static_cast<size_t>(gate) * rows + row) * C;
++    for (int c = threadIdx.x; c < C; c += blockDim.x) o[c] = tobf(bf(wg[c]) * (xr[c] * r));
++}
++
++// bf16 rows into source `s` of the fp32 bank [rows][sources][C] (exact): a block a row.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_loop_bank(const uint16_t* __restrict__ x,
++                                                                   float* __restrict__ bank, int sources, int s, int C) {
++    const size_t row = blockIdx.x;
++    for (int c = threadIdx.x; c < C; c += blockDim.x) bank[(row * sources + s) * C + c] = bf(x[row * C + c]);
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 2cc785d35..6ba65f4a7 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -119,6 +119,7 @@ pub const inkling2_rows: []const u8 = if (available) &Blob("fatbin_inkling2_rows
+ pub const inkling2_experts: []const u8 = if (available) &Blob("fatbin_inkling2_experts").bytes else &.{};
+ pub const inkling2_dspark: []const u8 = if (available) &Blob("fatbin_inkling2_dspark").bytes else &.{};
+ pub const inkling2_vision: []const u8 = if (available) &Blob("fatbin_inkling2_vision").bytes else &.{};
++pub const inkling2_loop: []const u8 = if (available) &Blob("fatbin_inkling2_loop").bytes else &.{};
+ pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes else &.{};
+ pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};
+ pub const glm_mm: []const u8 = if (available) &Blob("fatbin_glm_mm").bytes else &.{};
+diff --git a/zig/src/families/inkling2/dump_main.zig b/zig/src/families/inkling2/dump_main.zig
+index e37b191f6..4aa8ea6eb 100644
+--- a/zig/src/families/inkling2/dump_main.zig
++++ b/zig/src/families/inkling2/dump_main.zig
+@@ -4,7 +4,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const ink = @import("inkling2");
+ 
+-const usage = "usage: tf-inkling2-cuda <model dir> <ids.json> <out dir> [prompt chunk rows]\n" ++
++const usage = "usage: tf-inkling2-cuda <model dir> <ids.json> <out dir> [prompt chunk rows] [--zero-messages]\n" ++
+     "  ids.json maps text names to token ids; writes <name>.<path>.f32 ([rows][real vocab]) for paths prompt, decode\n" ++
+     "  (each text alone) and streams-prompt, streams-decode (all texts at once, a slot each);\n" ++
+     "  at two ranks set TF_INKLING2_RANK, TF_INKLING2_WORLD and NCCL_COMM_ID: each writes its vocab rows (.r<rank>.f32)\n";
+@@ -14,7 +14,9 @@ pub fn main(init: std.process.Init) !u8 {
+     const gpa = init.gpa;
+     const io = init.io;
+     const args = try init.minimal.args.toSlice(a);
+-    if (args.len != 4 and args.len != 5) {
++    const zero = args.len > 4 and std.mem.eql(u8, args[args.len - 1], "--zero-messages"); // Mini's planted control
++    const n_args = args.len - @intFromBool(zero);
++    if (n_args != 4 and n_args != 5) {
+         std.debug.print("{s}", .{usage});
+         return 2;
+     }
+@@ -38,7 +40,7 @@ pub fn main(init: std.process.Init) !u8 {
+     }
+     const texts = list.items;
+     if (texts.len == 0 or texts.len > ink.forward.max_items) return error.BadIds;
+-    const chunk = if (args.len == 5) try std.fmt.parseInt(usize, args[4], 10) else longest;
++    const chunk = if (n_args == 5) try std.fmt.parseInt(usize, args[4], 10) else longest;
+ 
+     var driver = try cuda.Driver.open();
+     defer driver.close();
+@@ -76,7 +78,7 @@ pub fn main(init: std.process.Init) !u8 {
+     defer st.deinit();
+     // prompt rows' projections by the GEMM, as the engine runs them (without cuBLASLt: the decode kernels)
+     m.prompt = ink.prompt_dense.Prompt.of(gpa, &driver, m.ops.prompt_tail, shape.rows, w.layers) catch null;
+-    var f: ink.forward.Forward = .{ .d = &driver, .m = &m, .w = &w, .b = &b, .shape = shape, .stream = stream };
++    var f: ink.forward.Forward = .{ .d = &driver, .m = &m, .w = &w, .b = &b, .shape = shape, .stream = stream, .zero_messages = zero };
+     if (lib) |*l| f.exchange = .{ .nccl = .{ .lib = l, .comm = comm } };
+     try std.Io.Dir.cwd().createDirPath(io, args[3]);
+     var out = try std.Io.Dir.cwd().openDir(io, args[3], .{});
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 128fd7cef..85ce35543 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -116,7 +116,9 @@ pub const Engine = struct {
+             break :blk null;
+         };
+         for (e.w.layers) |l| for ([_]cuda.exl3.Weight{ l.attn.k, l.attn.v, l.attn.r }) |x| try e.m.side.dense.reserve(stream, x);
+-        if (o.drafts and ds.present(io, gpa, dir)) try e.loadDrafter(dir, o.capacity);
++        if (o.drafts and ds.present(io, gpa, dir)) {
++            if (c.loop != null) std.log.warn("inkling2: Mini's drafter (four taps by visit) is not wired yet: serving without it", .{}) else try e.loadDrafter(dir, o.capacity);
++        }
+         errdefer e.freeDrafter();
+         e.vision = o.vision;
+         if (o.vision != null and rank == 0) e.tower = try vision.Tower.load(gpa, io, d, dir, pictures.picture_tokens);
+@@ -171,7 +173,7 @@ pub const Engine = struct {
+     /// The drafter's weights, scratch and the forwards' tap rows (rows x 8 taps x hidden, bf16).
+     fn loadDrafter(e: *Engine, dir: []const u8, capacity: usize) !void {
+         var dw = try ds.load(e.gpa, e.io, e.d, dir, &e.w);
+-        e.tap_at = dw.c.tapLayers(e.c.layers);
++        e.tap_at = dw.c.tapLayers(e.c.visits());
+         e.drafter = drun.Drafter.init(e.gpa, e.d, &e.m, e.stream, dw, &e.w, capacity, prompt_rows) catch |err| {
+             dw.deinit(e.gpa);
+             return err;
+@@ -201,7 +203,7 @@ pub const Engine = struct {
+     }
+ 
+     fn convBytes(e: *const Engine) usize {
+-        return @as(usize, e.c.layers) * 2 * 3 * (e.shape_d.kv * e.c.head_dim + e.c.hidden) * 4;
++        return @as(usize, e.c.visits()) * 2 * 3 * (e.shape_d.kv * e.c.head_dim + e.c.hidden) * 4;
+     }
+ 
+     /// Every slot's caches for `slots` streams, made once (the host's admission decides how many).
+@@ -368,7 +370,7 @@ pub const Engine = struct {
+         if (n == 0 or n > q.rows) return error.BadKeep;
+         if (n < q.rows and q.call == e.calls and e.sites != null) {
+             // the window's conv states ran over every row: the kept rows' inputs (kept in bd.hist) after the backup's
+-            const sites = @as(usize, e.c.layers) * 4;
++            const sites = @as(usize, e.c.visits()) * 4;
+             const backup = e.backup.?.ptr + e.slot * e.convBytes();
+             try ops.rewind(&e.m.ops, e.stream, e.sites.?.ptr, sites, e.c.hidden, backup, e.bd.hist, e.slot, q.row0, n);
+             st.pos[e.slot] = q.at + n;
+@@ -386,7 +388,7 @@ pub const Engine = struct {
+     /// Every conv site's slot-0 state, hist offset (bd's rows), backup offset (convCopy's order), width: on the device.
+     fn siteTable(e: *Engine) !cuda.DeviceBuffer {
+         const st = &e.st.?;
+-        const sites = try e.gpa.alloc(ops.RewindSite, @as(usize, e.c.layers) * 4);
++        const sites = try e.gpa.alloc(ops.RewindSite, @as(usize, e.c.visits()) * 4);
+         defer e.gpa.free(sites);
+         var off: usize = 0;
+         for (st.conv, 0..) |cv, i| for (cv, 0..) |base, j| {
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 9e3685e8b..329e77740 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -8,6 +8,9 @@ const experts = @import("experts.zig");
+ const weights = @import("weights.zig");
+ const vision = @import("vision.zig");
+ const prompt_dense = @import("prompt_dense.zig");
++const state = @import("state.zig");
++const loop = @import("loop.zig");
++const visits = @import("visits.zig");
+ 
+ const Buf = cuda.DeviceBuffer;
+ 
+@@ -18,6 +21,7 @@ pub const Modules = struct {
+     attn: kernels.Kernels,
+     ops: ops.Kernels,
+     side: Side,
++    loop: loop.Kernels,
+     prompt: ?prompt_dense.Prompt = null, // prompt rows' dense projections (Engine.init sets it once the weights load)
+ 
+     pub fn load(d: *const cuda.Driver) !Modules {
+@@ -29,12 +33,15 @@ pub const Modules = struct {
+         errdefer attn.unload();
+         var o = try ops.Kernels.load(d);
+         errdefer o.unload();
+-        return .{ .dense = dense, .experts = ex, .attn = attn, .ops = o, .side = try Side.init(d) };
++        var lk = try loop.Kernels.load(d);
++        errdefer lk.unload();
++        return .{ .dense = dense, .experts = ex, .attn = attn, .ops = o, .loop = lk, .side = try Side.init(d) };
+     }
+ 
+     pub fn deinit(m: *Modules) void {
+         if (m.prompt) |*p| p.deinit();
+         m.side.deinit();
++        m.loop.unload();
+         m.ops.unload();
+         m.attn.unload();
+         m.experts.unload();
+@@ -85,8 +92,9 @@ pub const Shape = struct {
+         return kernels.Layer.global(@intCast(s.context), s.kv8);
+     }
+ 
+-    fn layer(s: Shape, c: *const cfg.Config, i: usize) kernels.Layer {
+-        return if (c.layer[i] == .sliding) s.sliding(c) else s.global();
++    /// Cache slot `i`'s attention geometry (its layer's kind).
++    pub fn layer(s: Shape, c: *const cfg.Config, i: usize) kernels.Layer {
++        return if (c.slotKind(i) == .sliding) s.sliding(c) else s.global();
+     }
+ };
+ 
+@@ -105,100 +113,10 @@ pub fn kvSetting() !bool {
+     return fp8;
+ }
+ 
+-/// Bytes of one cache slot of a stream: K and V rings a layer plus four conv states (the per-stream cost).
+-pub fn slotBytes(c: *const cfg.Config, s: Shape) u64 {
+-    var total: u64 = 0;
+-    for (0..c.layers) |i| {
+-        total += 2 * @as(u64, s.layer(c, i).cacheBytes(s.kv));
+-        total += 2 * 3 * @as(u64, s.kv) * c.head_dim * 4 + 2 * 3 * @as(u64, c.hidden) * 4;
+-    }
+-    return total;
+-}
+-
+-fn alloc(d: *const cuda.Driver, list: *std.ArrayList(Buf), gpa: std.mem.Allocator, bytes: usize) !u64 {
+-    var b = try Buf.alloc(d, @max(bytes, 256));
+-    errdefer b.free();
+-    try b.fill8(0, null);
+-    try list.append(gpa, b);
+-    return b.ptr;
+-}
+-
+-/// `slots` streams' caches and conv states: K and V rings a layer, the last three inputs of each short convolution.
+-pub const State = struct {
+-    gpa: std.mem.Allocator,
+-    bufs: std.ArrayList(Buf) = .empty,
+-    kc: []u64 = &.{},
+-    vc: []u64 = &.{},
+-    ks: []u64 = &.{}, // fp8 global layers: each K row's scale, [slots][ring][kv] fp32 after the rows (else 0)
+-    vs: []u64 = &.{},
+-    conv: [][4]u64 = &.{}, // k, v (fp32 [slots][3][kv * 128]) and attention, MLP (fp32 [slots][3][hidden]) a layer
+-    pos: []usize = &.{}, // positions each slot's caches hold
+-    ring: [2]usize = .{ 0, 0 }, // sliding and global ring slots a key head
+-    kv: usize = 0,
+-
+-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, c: *const cfg.Config, s: Shape, slots: usize) !State {
+-        var st: State = .{ .gpa = gpa, .kv = s.kv };
+-        errdefer st.deinit();
+-        st.kc = try gpa.alloc(u64, c.layers);
+-        st.vc = try gpa.alloc(u64, c.layers);
+-        st.ks = try gpa.alloc(u64, c.layers);
+-        st.vs = try gpa.alloc(u64, c.layers);
+-        st.conv = try gpa.alloc([4]u64, c.layers);
+-        st.pos = try gpa.alloc(usize, slots);
+-        @memset(st.pos, 0);
+-        st.ring = .{ s.sliding(c).ring, s.global().ring };
+-        for (0..c.layers) |i| {
+-            const l = s.layer(c, i);
+-            const rows = slots * (l.cacheBytes(s.kv) - l.scaleBytes(s.kv));
+-            st.kc[i] = try alloc(d, &st.bufs, gpa, slots * l.cacheBytes(s.kv));
+-            st.vc[i] = try alloc(d, &st.bufs, gpa, slots * l.cacheBytes(s.kv));
+-            st.ks[i] = if (l.kv8) st.kc[i] + rows else 0;
+-            st.vs[i] = if (l.kv8) st.vc[i] + rows else 0;
+-            for (0..2) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, slots * 3 * s.kv * c.head_dim * 4);
+-            for (2..4) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, slots * 3 * @as(usize, c.hidden) * 4);
+-        }
+-        return st;
+-    }
+-
+-    pub fn cache(st: *const State, i: usize) kernels.Cache {
+-        return .{ .k = st.kc[i], .v = st.vc[i], .ks = st.ks[i], .vs = st.vs[i] };
+-    }
+-
+-    /// Back to empty streams: caches and conv states zeroed.
+-    pub fn reset(st: *State) !void {
+-        for (st.bufs.items) |b| try b.fill8(0, null);
+-        @memset(st.pos, 0);
+-    }
+-
+-    /// One slot's conv states zeroed on `s` (a fresh pass; its rings are only read at positions it writes).
+-    pub fn clearSlot(st: *State, c: *const cfg.Config, d: *const cuda.Driver, slot: usize, s: cuda.Stream) !void {
+-        for (st.conv) |cv| for (cv, 0..) |base, j| {
+-            const n = 3 * (if (j < 2) st.kv * c.head_dim else @as(usize, c.hidden)) * 4;
+-            const view: Buf = .{ .d = d, .ptr = base + slot * n, .len = n, .borrowed = true };
+-            try view.fill8(0, s.handle);
+-        };
+-        st.pos[slot] = 0;
+-    }
+-
+-    pub fn deinit(st: *State) void {
+-        for (st.bufs.items) |*b| b.free();
+-        st.bufs.deinit(st.gpa);
+-        st.gpa.free(st.kc);
+-        st.gpa.free(st.vc);
+-        st.gpa.free(st.ks);
+-        st.gpa.free(st.vs);
+-        st.gpa.free(st.conv);
+-        st.gpa.free(st.pos);
+-    }
+-};
+-
+-/// Byte offset of layer `i`'s conv site `j` (k, v, attention, MLP) in a hist of `rows` rows: [rows][C] a site.
+-pub fn histAt(c: *const cfg.Config, kv: usize, rows: usize, i: usize, j: usize) usize {
+-    const kvw = kv * c.head_dim;
+-    const layer = rows * (2 * kvw + 2 * @as(usize, c.hidden)) * 4;
+-    const in = if (j < 2) j * rows * kvw * 4 else 2 * rows * kvw * 4 + (j - 2) * rows * @as(usize, c.hidden) * 4;
+-    return i * layer + in;
+-}
++pub const State = state.State;
++pub const slotBytes = state.slotBytes;
++pub const histAt = state.histAt;
++const alloc = state.alloc;
+ 
+ /// Rows a grouped-experts call takes: its grouping kernel holds rows x 8 picks in 64 KiB of shared memory.
+ const expert_rows = 2048;
+@@ -246,6 +164,7 @@ pub const Buffers = struct {
+     logits: Buf = undefined, // fp32 [rows][padded vocab of the rank]
+     taps: u64 = 0, // bf16 [rows][8][hidden]: the drafter's taps of these rows (the engine's, with a drafter)
+     hist: u64 = 0, // fp32 conv inputs of these rows, histAt's layout (Shape.hist; else 0)
++    lp: loop.Scratch = .{}, // Mini's loop: the banks, mixes and gates of these rows (rows 0 without a loop)
+ 
+     /// Scratch for `s.rows` rows; `shared` partials, else its own for every row at the shape's context.
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, s: Shape, shared: ?Partials) !Buffers {
+@@ -292,7 +211,17 @@ pub const Buffers = struct {
+         const el = w.layers[0].experts;
+         b.exs = try cuda.exl3_experts.scratch(try A(&b, d, try experts.scratchBytes(el, @min(n, expert_rows), c.topk)), el, @min(n, expert_rows), c.topk);
+         b.logits = try Buf.alloc(d, n * w.share.vocab.len() * 4);
+-        if (s.hist) b.hist = try A(&b, d, histAt(c, s.kv, n, c.layers, 0));
++        if (s.hist) b.hist = try A(&b, d, histAt(c, s.kv, n, c.visits(), 0));
++        if (c.loop != null) {
++            const Ctx = struct {
++                b: *Buffers,
++                d: *const cuda.Driver,
++                fn f(x: @This(), bytes: usize) !u64 {
++                    return alloc(x.d, &x.b.bufs, x.b.gpa, bytes);
++                }
++            };
++            b.lp = try loop.Scratch.init(n, w.plan.bankSources(), Ctx{ .b = &b, .d = d }, Ctx.f);
++        }
+         return b;
+     }
+ 
+@@ -348,6 +277,7 @@ pub const Forward = struct {
+     tap_at: ?[7]u32 = null, // the layers whose input (the partial block) the drafter's first seven taps read
+     images: ?Images = null, // a prompt call's pictures: its one stream's rows from prompt position `lo`
+     last_logits: bool = false, // the head on the call's last row only (a prompt chunk draws from it alone)
++    zero_messages: bool = false, // a planted control (test tools only): the banks stay zero, so every message is 0
+ 
+     /// The drafter's taps of layer `i`'s input (b.x, the running partial block): copies only, the forward unchanged.
+     fn tap(f: Forward, i: usize, n: usize) !void {
+@@ -474,16 +404,35 @@ pub const Forward = struct {
+         var nb: usize = 0;
+         const hd: usize = c.head_dim;
+         const kvw = f.shape.kv * hd;
+-        for (f.w.layers, 0..) |*l, i| {
+-            try f.tap(i, n);
++        const plan = &f.w.plan;
++        const passes: u32 = if (c.loop) |lp| lp.passes else 1;
++        const sources = plan.bankSources();
++        var blocks: [ops.max_blocks]u64 = undefined;
++        for (&blocks, 0..) |*x, j| x.* = b.blocks + j * n * h * 2;
++        for (plan.visits[0..plan.n], 0..) |*v, vi| {
++            const i = v.layer;
++            const sl = v.slot; // the visit's caches and conv states
++            const l = &f.w.layers[i];
++            if (v.restart) { // a later pass starts again from the prelude's hidden state, its first core block
++                nb = plan.prelude_blocks;
++                try copy(f.d, b.x, blocks[nb], n * h * 2, s);
++            }
++            try f.tap(vi, n);
+             const global = l.kind == .global;
+-            var mix: ops.MixArgs = .{ .partial = b.x, .query = l.attn_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 1, .nq = @intCast(l.nq), .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
+-            for (0..nb) |j| mix.blocks[j] = b.blocks + j * n * h * 2;
+-            mix.norm = l.norms;
+-            try ops.mix(k, s, mix);
++            const bank_in = b.lp.bank[(v.pass + 1) % 2]; // the previous pass's bank (pass p writes bank p % 2)
++            if (v.messages) {
++                const m: loop.Mix = .{ .blocks = blocks[0..nb], .partial = b.x, .partial_bf16 = true, .query = l.attn_query, .nq = l.nq };
++                try loop.attention(&f.m.loop, s, &b.lp, l.loop.?, m, bank_in, sources, l.norms, n, c.eps, b.normed);
++            } else {
++                var mix: ops.MixArgs = .{ .partial = b.x, .query = l.attn_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 1, .nq = @intCast(l.nq), .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
++                for (0..nb) |j| mix.blocks[j] = blocks[j];
++                mix.norm = l.norms;
++                try ops.mix(k, s, mix);
++            }
++            const apart = global or v.messages; // q, k and v inputs differ: three normed rows
+             const xq = b.normed;
+-            const xk = if (global) b.normed + n * h * 2 else xq;
+-            const xv = if (global) b.normed + 2 * n * h * 2 else xq;
++            const xk = if (apart) b.normed + n * h * 2 else xq;
++            const xv = if (apart) b.normed + 2 * n * h * 2 else xq;
+             const a = &l.attn;
+             const sd = &f.m.side;
+             // prompt rows run the narrow projections on the main stream: one GEMM scratch, and they fill the GPU alone
+@@ -502,29 +451,35 @@ pub const Forward = struct {
+             try f.dense(a.q, xq, n, b.q, .bf16);
+             try f.dense(a.gate, xq, n, b.gate, .bf16);
+             try s.wait(sd.join);
+-            const cv = st.conv[i];
+-            try ops.conv(k, s, .{ .x = b.kf, .state = cv[0], .w = a.k_conv, .dyn = if (global) b.dk else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.kraw, .segs = conv_segs, .hist = f.hist(i, 0), .state_stride = @intCast(3 * kvw) }, streams);
+-            try ops.conv(k, s, .{ .x = b.vf, .state = cv[1], .w = a.v_conv, .dyn = if (global) b.dv else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.vraw, .segs = conv_segs, .hist = f.hist(i, 1), .state_stride = @intCast(3 * kvw) }, streams);
+-            var lay_i = f.shape.layer(c, i);
++            const cv = st.conv[sl];
++            try ops.conv(k, s, .{ .x = b.kf, .state = cv[0], .w = a.k_conv, .dyn = if (global) b.dk else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.kraw, .segs = conv_segs, .hist = f.hist(sl, 0), .state_stride = @intCast(3 * kvw) }, streams);
++            try ops.conv(k, s, .{ .x = b.vf, .state = cv[1], .w = a.v_conv, .dyn = if (global) b.dv else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.vraw, .segs = conv_segs, .hist = f.hist(sl, 1), .state_stride = @intCast(3 * kvw) }, streams);
++            var lay_i = f.shape.layer(c, sl);
+             lay_i.ring = @intCast(st.ring[@intFromBool(global)]); // the caches' rings, whatever rows this call's scratch holds
+             const rows = rows_by[@intFromBool(global)];
+             const prep: kernels.Prep = .{ .qk_clip = c.qk_clip, .rel_clip = c.rel_clip, .floor = c.log_floor, .alpha = c.log_alpha, .eps = c.eps };
+-            try kernels.prep(&f.m.attn, s, rows, lay_i, prep, .{ b.q, b.kraw, b.vraw, b.r }, .{ a.q_scale, a.rel_scale }, b.qo, b.relo, st.cache(i));
++            try kernels.prep(&f.m.attn, s, rows, lay_i, prep, .{ b.q, b.kraw, b.vraw, b.r }, .{ a.q_scale, a.rel_scale }, b.qo, b.relo, st.cache(sl));
+             try kernels.relTable(&f.m.attn, s, rows, b.relo, a.rel_proj, b.tab);
+-            try kernels.attend(&f.m.attn, s, rows, lay_i, p.stride, b.parts.slots, b.qo, st.cache(i), b.tab, b.parts.o, b.parts.ml, b.sink, b.gate, b.att);
++            try kernels.attend(&f.m.attn, s, rows, lay_i, p.stride, b.parts.slots, b.qo, st.cache(sl), b.tab, b.parts.o, b.parts.ml, b.sink, b.gate, b.att);
+             try f.dense(a.o, b.att, n, f.slot(b.ao, n), .f32);
+             const ao = try f.summed(b.ao, n);
+             const boundary = i % c.block_layers == 0;
+             if (boundary) {
+                 if (nb == ops.max_blocks) return error.Inkling2Blocks;
+-                try copy(f.d, b.blocks + nb * n * h * 2, b.x, n * h * 2, s);
++                try copy(f.d, blocks[nb], b.x, n * h * 2, s);
+                 nb += 1;
++                if (visits.savesBlock(plan, v, passes) and !f.zero_messages) try loop.save(&f.m.loop, s, b.x, b.lp.bank[v.pass % 2], sources, visits.bankIndex(plan, i), n);
++            }
++            try ops.conv(k, s, .{ .x = ao.x, .parts = ao.parts, .part_stride = ao.stride, .state = cv[2], .w = l.attn_conv, .base = if (boundary) 0 else b.x, .resid = b.resid, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 1, .segs = conv_segs, .hist = f.hist(sl, 2), .state_stride = @intCast(3 * h) }, streams);
++            if (v.messages) {
++                const m: loop.Mix = .{ .blocks = blocks[0..nb], .partial = b.resid, .partial_bf16 = false, .query = l.mlp_query, .nq = 1 };
++                try loop.mlp(&f.m.loop, s, &b.lp, l.loop.?, m, bank_in, sources, l.mlp_norm, n, c.eps, b.normed);
++            } else {
++                var mm: ops.MixArgs = .{ .partial = b.resid, .query = l.mlp_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 0, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
++                for (0..nb) |j| mm.blocks[j] = blocks[j];
++                mm.norm[0] = l.mlp_norm;
++                try ops.mix(k, s, mm);
+             }
+-            try ops.conv(k, s, .{ .x = ao.x, .parts = ao.parts, .part_stride = ao.stride, .state = cv[2], .w = l.attn_conv, .base = if (boundary) 0 else b.x, .resid = b.resid, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 1, .segs = conv_segs, .hist = f.hist(i, 2), .state_stride = @intCast(3 * h) }, streams);
+-            var mm: ops.MixArgs = .{ .partial = b.resid, .query = l.mlp_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 0, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
+-            for (0..nb) |j| mm.blocks[j] = b.blocks + j * n * h * 2;
+-            mm.norm[0] = l.mlp_norm;
+-            try ops.mix(k, s, mm);
+             try ops.rowdot(k, s, b.normed, l.router, b.scores, n, c.experts, h, false, true);
+             try ops.topk(k, s, b.scores, l.bias, b.pick, b.wts, n, c.experts, c.topk, c.route_scale);
+             const out = f.slot(b.moe, n);
+@@ -536,11 +491,12 @@ pub const Forward = struct {
+                 try experts.run(&f.m.experts, k, s, l.experts, caps, b.normed + r0 * h * 2, h, .bf16, b.pick + sel, b.wts + sel, w, out + r0 * h * 4, b.exs);
+             }
+             const mo = try f.summed(b.moe, n);
+-            try ops.conv(k, s, .{ .x = mo.x, .parts = mo.parts, .part_stride = mo.stride, .state = cv[3], .w = l.mlp_conv, .resid = b.resid, .out = b.x, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 2, .segs = conv_segs, .hist = f.hist(i, 3), .state_stride = @intCast(3 * h) }, streams);
++            try ops.conv(k, s, .{ .x = mo.x, .parts = mo.parts, .part_stride = mo.stride, .state = cv[3], .w = l.mlp_conv, .resid = b.resid, .out = b.x, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 2, .segs = conv_segs, .hist = f.hist(sl, 3), .state_stride = @intCast(3 * h) }, streams);
++            if (v.saves_bank and !f.zero_messages) try loop.save(&f.m.loop, s, b.x, b.lp.bank[v.pass % 2], sources, plan.bank_n, n);
+         }
+-        try f.tap(f.w.layers.len, n); // a truncated pack's taps past its last layer: the partial block at the end
++        try f.tap(plan.n, n); // a truncated pack's taps past its last layer: the partial block at the end
+         var fm: ops.MixArgs = .{ .partial = b.x, .query = f.w.out_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 1, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
+-        for (0..nb) |j| fm.blocks[j] = b.blocks + j * n * h * 2;
++        for (0..nb) |j| fm.blocks[j] = blocks[j];
+         fm.norm[0] = f.w.norm;
+         try ops.mix(k, s, fm);
+         if (f.tap_at != null) try f.tapCopy(b.normed, 7, n); // the last tap: the head's input
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index fc230c1d1..e07c42d63 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -13,6 +13,9 @@ pub const exl3 = @import("exl3.zig");
+ pub const weights = @import("weights.zig");
+ pub const experts = @import("experts.zig");
+ pub const forward = @import("forward.zig");
++pub const state = @import("state.zig");
++pub const loop = @import("loop.zig");
++pub const visits = @import("visits.zig");
+ pub const prompt_dense = @import("prompt_dense.zig");
+ pub const sampler = @import("sampler.zig");
+ pub const kept = @import("kept.zig");
+@@ -42,6 +45,8 @@ test {
+     _ = prompt_dense;
+     _ = experts;
+     _ = forward;
++    _ = state;
++    _ = loop;
+     _ = sampler;
+     _ = kept;
+     _ = engine;
+diff --git a/zig/src/families/inkling2/kept.zig b/zig/src/families/inkling2/kept.zig
+index e85494e08..37ff49a76 100644
+--- a/zig/src/families/inkling2/kept.zig
++++ b/zig/src/families/inkling2/kept.zig
+@@ -10,8 +10,8 @@ const Snap = struct { slot: usize, at: usize, buf: ?cuda.DeviceBuffer };
+ /// Bytes a state takes on this rank: every sliding layer's K and V ring of one slot, then its conv states.
+ pub fn bytes(c: *const cfg.Config, st: *const fw.State, conv: usize) u64 {
+     var total: u64 = conv;
+-    for (0..c.layers) |i| {
+-        if (c.layer[i] == .sliding) total += 2 * ringBytes(c, st);
++    for (0..c.visits()) |i| {
++        if (c.slotKind(i) == .sliding) total += 2 * ringBytes(c, st);
+     }
+     return total;
+ }
+@@ -93,8 +93,8 @@ pub const Store = struct {
+ fn copy(d: *const cuda.Driver, stream: cuda.Stream, c: *const cfg.Config, st: *const fw.State, slot: usize, buf: u64, out: bool) !void {
+     const rb = ringBytes(c, st);
+     var off: u64 = 0;
+-    for (0..c.layers) |i| {
+-        if (c.layer[i] != .sliding) continue;
++    for (0..c.visits()) |i| {
++        if (c.slotKind(i) != .sliding) continue;
+         for ([_]u64{ st.kc[i], st.vc[i] }) |base| {
+             const src = base + slot * rb;
+             try move(d, stream, if (out) buf + off else src, if (out) src else buf + off, rb);
+diff --git a/zig/src/families/inkling2/loop.zig b/zig/src/families/inkling2/loop.zig
+new file mode 100644
+index 000000000..ba76cab78
+--- /dev/null
++++ b/zig/src/families/inkling2/loop.zig
+@@ -0,0 +1,204 @@
++//! Mini's loop on the device (inkling2/loop.cu): a message visit's raw mixes, messages, rank-64 gates and norms.
++const std = @import("std");
++const cuda = @import("cuda");
++
++pub const width = 2304; // the kernels' hidden size (loop.cu kWidth)
++const rank = 64;
++const split = 9;
++const most_gates = 3;
++
++/// loop.cu's Gates: a core layer's four gates (q, k, v, MLP) or one gate repeated, bf16 down, forget and gain.
++pub const Gates = extern struct { down: [4]u64, forget: [4]u64, gain: [4]u64 };
++
++/// loop.cu's RawMix, field for field.
++const RawMix = extern struct {
++    blocks: [8]u64 = @splat(0),
++    partial: u64,
++    query: u64,
++    out: u64,
++    n_blocks: i32,
++    partial_bf16: i32,
++    nq: i32,
++    rows: i32,
++    c: i32,
++};
++
++const Norms = extern struct { w: [3]u64 };
++
++/// A core layer's loop weights: its four gates and their queries as one fp32 [4][hidden] table (q, k, v, MLP).
++pub const Layer = struct {
++    gates: Gates,
++    queries: u64,
++
++    /// The gate of stream `j` (q 0, k 1, v 2, MLP 3) in every place, for a launch of that one gate.
++    fn one(l: Layer, j: usize) Gates {
++        return .{ .down = @splat(l.gates.down[j]), .forget = @splat(l.gates.forget[j]), .gain = @splat(l.gates.gain[j]) };
++    }
++};
++
++pub const Kernels = struct {
++    mod: cuda.Module,
++    msg: cuda.Function,
++    down8: cuda.Function,
++    down16: cuda.Function,
++    down64: cuda.Function,
++    blend: cuda.Function,
++    mix: cuda.Function,
++    norm: cuda.Function,
++    bank: cuda.Function,
++
++    pub fn load(d: *const cuda.Driver) !Kernels {
++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
++        var mod = try cuda.Module.load(d, cuda.kernels.inkling2_loop);
++        errdefer mod.unload();
++        return .{
++            .mod = mod,
++            .msg = try mod.function("tf_ink2_loop_msg"),
++            .down8 = try mod.function("tf_ink2_loop_down8"),
++            .down16 = try mod.function("tf_ink2_loop_down16"),
++            .down64 = try mod.function("tf_ink2_loop_down64"),
++            .blend = try mod.function("tf_ink2_loop_blend"),
++            .mix = try mod.function("tf_ink2_loop_mix"),
++            .norm = try mod.function("tf_ink2_loop_norm"),
++            .bank = try mod.function("tf_ink2_loop_bank"),
++        };
++    }
++
++    pub fn unload(k: *Kernels) void {
++        k.mod.unload();
++        k.* = undefined;
++    }
++};
++
++/// A call's loop scratch for `rows` rows (all zeroed at allocation; the down kernels' counts stay zeroed after each).
++pub const Scratch = struct {
++    rows: usize = 0,
++    bank: [2]u64 = .{ 0, 0 }, // fp32 [rows][sources][hidden]: the bank a pass writes, the next pass reads
++    h: u64 = 0, // fp32 [3][rows][hidden]: a visit's raw mixes
++    pair: u64 = 0, // bf16 [rows][3][2 hidden]: the gates' down inputs
++    msg: u64 = 0, // fp32 [rows][3][hidden]
++    part: u64 = 0, // fp32 [rows][3][9][64]: the down slices
++    count: u64 = 0, // u32 [row tiles][3][8]
++    g: u64 = 0, // bf16 [rows][3][64]
++    out: u64 = 0, // fp32 [rows][3][hidden]: the gates' outputs
++
++    /// Scratch for `rows` rows with `sources` bank states, each buffer from A(ctx, bytes) (zeroed).
++    pub fn init(rows: usize, sources: usize, ctx: anytype, comptime A: anytype) !Scratch {
++        const w: usize = width;
++        const g = most_gates;
++        return .{
++            .rows = rows,
++            .bank = .{ try A(ctx, rows * sources * w * 4), try A(ctx, rows * sources * w * 4) },
++            .h = try A(ctx, g * rows * w * 4),
++            .pair = try A(ctx, rows * g * 2 * w * 2),
++            .msg = try A(ctx, rows * g * w * 4),
++            .part = try A(ctx, rows * g * split * rank * 4),
++            .count = try A(ctx, (rows + 15) / 16 * g * 8 * 4),
++            .g = try A(ctx, rows * g * rank * 2),
++            .out = try A(ctx, rows * g * w * 4),
++        };
++    }
++};
++
++fn go(f: cuda.Function, s: cuda.Stream, grid: cuda.Dim3, threads: u32, a: *cuda.Args) !void {
++    try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = threads } }, s, a);
++}
++
++/// The messages, gates and blends of `gates` streams of h (fp32, `h_row` / `h_gate` elements apart) into x.out.
++fn gate(k: *const Kernels, s: cuda.Stream, x: *const Scratch, bank: u64, sources: usize, queries: u64, h: u64, h_row: usize, h_gate: usize, gates: usize, w: Gates, rows: usize, eps: f32) !void {
++    const scale: f32 = @floatCast(std.math.pow(f64, width, -0.5));
++    var a: cuda.Args = .{};
++    a.add(bank);
++    a.add(@as(i32, @intCast(sources)));
++    a.add(queries);
++    a.add(h);
++    a.add(@as(i64, @intCast(h_row)));
++    a.add(@as(i64, @intCast(h_gate)));
++    a.add(@as(i32, @intCast(gates)));
++    a.add(scale);
++    a.add(eps);
++    a.add(w);
++    a.add(x.msg);
++    a.add(x.pair);
++    try go(k.msg, s, .{ .x = @intCast(rows * gates) }, 256, &a);
++    // launch shapes by rows: none of them moves a bit (each output's sums keep one order)
++    const out: usize = if (rows <= 16) 8 else if (rows <= 128) 16 else 64;
++    var b: cuda.Args = .{};
++    b.add(x.pair);
++    b.add(w);
++    b.add(@as(i32, @intCast(rows)));
++    b.add(@as(i32, @intCast(gates)));
++    b.add(x.part);
++    b.add(x.count);
++    b.add(x.g);
++    const f = if (out == 8) k.down8 else if (out == 16) k.down16 else k.down64;
++    try go(f, s, .{ .x = @intCast((rows + 15) / 16), .y = split, .z = @intCast(gates * (rank / out)) }, 128, &b);
++    const per: usize = if (rows <= 16) 16 else 32;
++    var c: cuda.Args = .{};
++    c.add(h);
++    c.add(@as(i64, @intCast(h_row)));
++    c.add(@as(i64, @intCast(h_gate)));
++    c.add(x.msg);
++    c.add(x.g);
++    c.add(w);
++    c.add(@as(i32, @intCast(rows)));
++    c.add(@as(i32, @intCast(gates)));
++    c.add(@as(i32, @intCast(per)));
++    c.add(x.out);
++    try go(k.blend, s, .{ .x = width / 32, .y = @intCast(gates), .z = @intCast((rows + per - 1) / per) }, 256, &c);
++}
++
++/// What a message visit's mix reads: the completed blocks and the partial, and the layer's mix queries.
++pub const Mix = struct { blocks: []const u64, partial: u64, partial_bf16: bool, query: u64, nq: usize };
++
++fn mix(k: *const Kernels, s: cuda.Stream, m: Mix, out: u64, rows: usize) !void {
++    var r: RawMix = .{ .partial = m.partial, .query = m.query, .out = out, .n_blocks = @intCast(m.blocks.len), .partial_bf16 = @intFromBool(m.partial_bf16), .nq = @intCast(m.nq), .rows = @intCast(rows), .c = width };
++    for (m.blocks, 0..) |b, j| r.blocks[j] = b;
++    var a: cuda.Args = .{};
++    a.add(r);
++    try go(k.mix, s, .{ .x = @intCast(rows) }, 512, &a);
++}
++
++fn norm(k: *const Kernels, s: cuda.Stream, x: u64, w: [3]u64, gates: usize, out: u64, rows: usize, eps: f32) !void {
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(Norms{ .w = w });
++    a.add(out);
++    a.add(@as(i32, @intCast(rows)));
++    a.add(@as(i32, width));
++    a.add(eps);
++    try go(k.norm, s, .{ .x = @intCast(rows), .y = @intCast(gates) }, 512, &a);
++}
++
++/// A message visit's q, k and v inputs: the mix, the three gates on the previous pass's bank, each input norm (bf16).
++pub fn attention(k: *const Kernels, s: cuda.Stream, x: *const Scratch, l: Layer, m: Mix, bank: u64, sources: usize, norms: [3]u64, rows: usize, eps: f32, out: u64) !void {
++    try mix(k, s, m, x.h, rows);
++    const h_gate: usize = if (m.nq == 3) rows * width else 0;
++    try gate(k, s, x, bank, sources, l.queries, x.h, width, h_gate, 3, l.gates, rows, eps);
++    const nw: [3]u64 = if (norms[1] == 0) @splat(norms[0]) else norms;
++    try norm(k, s, x.out, nw, 3, out, rows, eps);
++}
++
++/// A message visit's MLP input: the mix of the fp32 residual, the MLP gate, mlp_norm into bf16 [rows][hidden].
++pub fn mlp(k: *const Kernels, s: cuda.Stream, x: *const Scratch, l: Layer, m: Mix, bank: u64, sources: usize, mlp_norm: u64, rows: usize, eps: f32, out: u64) !void {
++    try mix(k, s, m, x.h, rows);
++    try gate(k, s, x, bank, sources, l.queries + 3 * width * 4, x.h, width, 0, 1, l.one(3), rows, eps);
++    try norm(k, s, x.out, @splat(mlp_norm), 1, out, rows, eps);
++}
++
++/// bf16 rows `src` into bank source `at` of `sources`.
++pub fn save(k: *const Kernels, s: cuda.Stream, src: u64, bank: u64, sources: usize, at: usize, rows: usize) !void {
++    var a: cuda.Args = .{};
++    a.add(src);
++    a.add(bank);
++    a.add(@as(i32, @intCast(sources)));
++    a.add(@as(i32, @intCast(at)));
++    a.add(@as(i32, width));
++    try go(k.bank, s, .{ .x = @intCast(rows) }, 256, &a);
++}
++
++test "loop: the argument structs keep loop.cu's layouts" {
++    try std.testing.expectEqual(@as(usize, 96), @sizeOf(Gates));
++    try std.testing.expectEqual(@as(usize, 8 * 8 + 3 * 8 + 5 * 4 + 4), @sizeOf(RawMix));
++    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Norms));
++}
+diff --git a/zig/src/families/inkling2/native.zig b/zig/src/families/inkling2/native.zig
+index 9518b3e35..c73e61544 100644
+--- a/zig/src/families/inkling2/native.zig
++++ b/zig/src/families/inkling2/native.zig
+@@ -14,6 +14,8 @@ const pictures = @import("pictures.zig");
+ const tower = @import("vision.zig");
+ 
+ pub const model_type = "inkling2";
++/// Inkling 2 Mini: Small's layers with a looped core (config.zig reads its loop_config).
++pub const also_model_types: []const []const u8 = &.{"inkling2_loop"};
+ pub const formats: []const []const u8 = &.{"exl3"};
+ /// The model's native window: no rope, so 1M is served as trained.
+ pub const default_context: i64 = 1048576;
+diff --git a/zig/src/families/inkling2/shape.zig b/zig/src/families/inkling2/shape.zig
+index ec90708b8..137781c48 100644
+--- a/zig/src/families/inkling2/shape.zig
++++ b/zig/src/families/inkling2/shape.zig
+@@ -38,6 +38,24 @@ pub const Config = struct {
+     eos: [4]u32 = .{ 200006, 0, 0, 0 },
+     eos_count: u32 = 1,
+     layer: [max_layers]Kind = undefined,
++    loop: ?shared.Loop = null, // Mini's loop: its core runs `passes` times, each pass on cache slots of its own
++
++    /// Layer visits a forward makes, and cache slots a stream keeps (one a visit): Small's are its layers.
++    pub fn visits(c: *const Config) u32 {
++        const l = c.loop orelse return c.layers;
++        return c.layers + (l.passes - 1) * l.core();
++    }
++
++    /// The layer whose weights and attention kind cache slot `s` serves (visits.zig's slot numbering).
++    pub fn slotLayer(c: *const Config, s: usize) usize {
++        if (s < c.layers) return s;
++        const l = c.loop.?;
++        return l.start + (s - c.layers) % l.core();
++    }
++
++    pub fn slotKind(c: *const Config, s: usize) Kind {
++        return c.layer[c.slotLayer(s)];
++    }
+ 
+     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
+         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+@@ -58,9 +76,11 @@ pub const Config = struct {
+         return n;
+     }
+ 
+-    /// Key and value bytes one token takes on a rank holding `kv` key heads: the global layers' bf16 keys and values.
++    /// Key and value bytes one token takes on a rank holding `kv` key heads: every global visit's bf16 keys and values.
+     pub fn tokenBytes(c: *const Config, kv: u32) u64 {
+-        return @as(u64, c.globals()) * kv * c.head_dim * 2 * 2;
++        var n: u64 = 0;
++        for (0..c.visits()) |s| n += @intFromBool(c.slotKind(s) == .global);
++        return n * kv * c.head_dim * 2 * 2;
+     }
+ 
+     /// The end-of-reply ids config.json names.
+@@ -114,6 +134,7 @@ pub fn from(s: *const shared.Config) Error!Config {
+         .context = t.max_context,
+         .eos = .{ s.eos, 0, 0, 0 },
+         .eos_count = 1,
++        .loop = t.loop,
+     };
+     for (c.layer[0..c.layers], 0..) |*k, i| k.* = if (shared.isGlobal(@intCast(i))) .global else .sliding;
+     try validate(&c);
+diff --git a/zig/src/families/inkling2/state.zig b/zig/src/families/inkling2/state.zig
+new file mode 100644
+index 000000000..a87001267
+--- /dev/null
++++ b/zig/src/families/inkling2/state.zig
+@@ -0,0 +1,104 @@
++//! A rank's per-stream caches: K and V rings and conv states for every cache slot (Small: a layer, Mini: a visit).
++const std = @import("std");
++const cuda = @import("cuda");
++const cfg = @import("shape.zig");
++const kernels = @import("kernels.zig");
++const fw = @import("forward.zig");
++
++const Buf = cuda.DeviceBuffer;
++
++/// Bytes of one cache slot of a stream: K and V rings a visit plus four conv states (the per-stream cost).
++pub fn slotBytes(c: *const cfg.Config, s: fw.Shape) u64 {
++    var total: u64 = 0;
++    for (0..c.visits()) |i| {
++        total += 2 * @as(u64, s.layer(c, i).cacheBytes(s.kv));
++        total += 2 * 3 * @as(u64, s.kv) * c.head_dim * 4 + 2 * 3 * @as(u64, c.hidden) * 4;
++    }
++    return total;
++}
++
++pub fn alloc(d: *const cuda.Driver, list: *std.ArrayList(Buf), gpa: std.mem.Allocator, bytes: usize) !u64 {
++    var b = try Buf.alloc(d, @max(bytes, 256));
++    errdefer b.free();
++    try b.fill8(0, null);
++    try list.append(gpa, b);
++    return b.ptr;
++}
++
++/// `slots` streams' caches and conv states: K and V rings a visit, the last three inputs of each short convolution.
++pub const State = struct {
++    gpa: std.mem.Allocator,
++    bufs: std.ArrayList(Buf) = .empty,
++    kc: []u64 = &.{},
++    vc: []u64 = &.{},
++    ks: []u64 = &.{}, // fp8 global layers: each K row's scale, [slots][ring][kv] fp32 after the rows (else 0)
++    vs: []u64 = &.{},
++    conv: [][4]u64 = &.{}, // k, v (fp32 [slots][3][kv * 128]) and attention, MLP (fp32 [slots][3][hidden]) a visit
++    pos: []usize = &.{}, // positions each slot's caches hold
++    ring: [2]usize = .{ 0, 0 }, // sliding and global ring slots a key head
++    kv: usize = 0,
++
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, c: *const cfg.Config, s: fw.Shape, slots: usize) !State {
++        var st: State = .{ .gpa = gpa, .kv = s.kv };
++        errdefer st.deinit();
++        const n = c.visits();
++        st.kc = try gpa.alloc(u64, n);
++        st.vc = try gpa.alloc(u64, n);
++        st.ks = try gpa.alloc(u64, n);
++        st.vs = try gpa.alloc(u64, n);
++        st.conv = try gpa.alloc([4]u64, n);
++        st.pos = try gpa.alloc(usize, slots);
++        @memset(st.pos, 0);
++        st.ring = .{ s.sliding(c).ring, s.global().ring };
++        for (0..n) |i| {
++            const l = s.layer(c, i);
++            const rows = slots * (l.cacheBytes(s.kv) - l.scaleBytes(s.kv));
++            st.kc[i] = try alloc(d, &st.bufs, gpa, slots * l.cacheBytes(s.kv));
++            st.vc[i] = try alloc(d, &st.bufs, gpa, slots * l.cacheBytes(s.kv));
++            st.ks[i] = if (l.kv8) st.kc[i] + rows else 0;
++            st.vs[i] = if (l.kv8) st.vc[i] + rows else 0;
++            for (0..2) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, slots * 3 * s.kv * c.head_dim * 4);
++            for (2..4) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, slots * 3 * @as(usize, c.hidden) * 4);
++        }
++        return st;
++    }
++
++    pub fn cache(st: *const State, i: usize) kernels.Cache {
++        return .{ .k = st.kc[i], .v = st.vc[i], .ks = st.ks[i], .vs = st.vs[i] };
++    }
++
++    /// Back to empty streams: caches and conv states zeroed.
++    pub fn reset(st: *State) !void {
++        for (st.bufs.items) |b| try b.fill8(0, null);
++        @memset(st.pos, 0);
++    }
++
++    /// One slot's conv states zeroed on `s` (a fresh pass; its rings are only read at positions it writes).
++    pub fn clearSlot(st: *State, c: *const cfg.Config, d: *const cuda.Driver, slot: usize, s: cuda.Stream) !void {
++        for (st.conv) |cv| for (cv, 0..) |base, j| {
++            const n = 3 * (if (j < 2) st.kv * c.head_dim else @as(usize, c.hidden)) * 4;
++            const view: Buf = .{ .d = d, .ptr = base + slot * n, .len = n, .borrowed = true };
++            try view.fill8(0, s.handle);
++        };
++        st.pos[slot] = 0;
++    }
++
++    pub fn deinit(st: *State) void {
++        for (st.bufs.items) |*b| b.free();
++        st.bufs.deinit(st.gpa);
++        st.gpa.free(st.kc);
++        st.gpa.free(st.vc);
++        st.gpa.free(st.ks);
++        st.gpa.free(st.vs);
++        st.gpa.free(st.conv);
++        st.gpa.free(st.pos);
++    }
++};
++
++/// Byte offset of cache slot `i`'s conv site `j` (k, v, attention, MLP) in a hist of `rows` rows: [rows][C] a site.
++pub fn histAt(c: *const cfg.Config, kv: usize, rows: usize, i: usize, j: usize) usize {
++    const kvw = kv * c.head_dim;
++    const layer = rows * (2 * kvw + 2 * @as(usize, c.hidden)) * 4;
++    const in = if (j < 2) j * rows * kvw * 4 else 2 * rows * kvw * 4 + (j - 2) * rows * @as(usize, c.hidden) * 4;
++    return i * layer + in;
++}
+diff --git a/zig/src/families/inkling2/visits.zig b/zig/src/families/inkling2/visits.zig
+index d4c316546..70cae5b8e 100644
+--- a/zig/src/families/inkling2/visits.zig
++++ b/zig/src/families/inkling2/visits.zig
+@@ -58,23 +58,40 @@ pub const Plan = struct {
+ 
+ /// The visit plan of a parsed config; Small's is its layers in order, each in pass 0.
+ pub fn build(c: *const config.Text) Plan {
+-    var p: Plan = undefined;
+-    p.n = 0;
+-    p.bank_n = 0;
+-    const l = c.loop orelse config.Loop{ .start = c.layers, .end = c.layers, .passes = 1, .rank = 0 };
+-    p.prelude_blocks = (l.start + c.block - 1) / c.block;
++    const p = of(c.layers, c.block, c.loop);
++    std.debug.assert(p.n == c.visits());
++    return p;
++}
++
++/// The plan of `layers` layers in attention-residual blocks of `block`, with or without a loop.
++pub fn of(layers: u32, block: u32, loop: ?config.Loop) Plan {
++    var p = std.mem.zeroes(Plan);
++    const l = loop orelse config.Loop{ .start = layers, .end = layers, .passes = 1, .rank = 0 };
++    p.prelude_blocks = (l.start + block - 1) / block;
+     // the first pass appends a block at each boundary in the core; the bank keeps those after the opening one
+-    for (l.start..l.end) |k| if (k > l.start and k % c.block == 0) {
++    for (l.start..l.end) |k| if (k > l.start and k % block == 0) {
+         p.bank_blocks[p.bank_n] = @intCast(k);
+         p.bank_n += 1;
+     };
+-    for (0..l.start) |i| add(&p, @intCast(i), 0, l, c.layers);
+-    for (0..l.passes) |pass| for (l.start..l.end) |i| add(&p, @intCast(i), @intCast(pass), l, c.layers);
+-    for (l.end..c.layers) |i| add(&p, @intCast(i), 0, l, c.layers);
+-    std.debug.assert(p.n == c.visits());
++    for (0..l.start) |i| add(&p, @intCast(i), 0, l, layers);
++    for (0..l.passes) |pass| for (l.start..l.end) |i| add(&p, @intCast(i), @intCast(pass), l, layers);
++    for (l.end..layers) |i| add(&p, @intCast(i), 0, l, layers);
+     return p;
+ }
+ 
++/// Whether a visit to `layer` in `pass` writes the bank a later pass reads (its input, as one of bank_blocks).
++pub fn savesBlock(p: *const Plan, v: *const Visit, passes: u32) bool {
++    if (v.core == null or v.pass + 1 >= passes) return false;
++    for (p.bank_blocks[0..p.bank_n]) |b| if (b == v.layer) return true;
++    return false;
++}
++
++/// The bank row a block-saving visit writes: its place among bank_blocks.
++pub fn bankIndex(p: *const Plan, layer: u32) u32 {
++    for (p.bank_blocks[0..p.bank_n], 0..) |b, i| if (b == layer) return @intCast(i);
++    unreachable;
++}
++
+ fn add(p: *Plan, i: u32, pass: u32, l: config.Loop, layers: u32) void {
+     const in_core = i >= l.start and i < l.end;
+     p.visits[p.n] = .{
+diff --git a/zig/src/families/inkling2/weights.zig b/zig/src/families/inkling2/weights.zig
+index e7d23a3d5..a1fd87510 100644
+--- a/zig/src/families/inkling2/weights.zig
++++ b/zig/src/families/inkling2/weights.zig
+@@ -5,6 +5,8 @@ const core = @import("core");
+ const cfg = @import("shape.zig");
+ const shard = @import("shard.zig");
+ const exl3 = @import("exl3.zig");
++const loop = @import("loop.zig");
++const visits = @import("visits.zig");
+ 
+ const Tensor = core.checkpoint.Tensor;
+ pub const Linear = cuda.exl3.Weight;
+@@ -43,6 +45,7 @@ pub const Layer = struct {
+     router: u64, // bf16 [experts][hidden]
+     bias: u64, // fp32 [experts]
+     experts: cuda.exl3_experts.Layer,
++    loop: ?loop.Layer = null, // a core layer of Mini's loop: its message gates and cross-pass queries
+ };
+ 
+ pub const Weights = struct {
+@@ -57,6 +60,7 @@ pub const Weights = struct {
+     out_query: u64 = 0, // fp32 [hidden]
+     head: Linear = undefined, // the rank's vocabulary rows of the 8-bit head
+     layers: []Layer = &.{},
++    plan: visits.Plan = undefined, // the order the forward visits the layers in (Small: each once)
+     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
+     bytes: u64 = 0,
+ 
+@@ -193,8 +197,35 @@ const Loader = struct {
+         l.router = try L.put((try L.expect("layers.{d}.mlp.gate.weight", .{i}, .bf16, &.{ c.experts, h })).bytes);
+         l.bias = try L.vector("layers.{d}.mlp.gate.bias", .{i}, .f32, c.experts);
+         l.experts = try exl3.experts(L.gpa, L.ck, L.sink, prefix, i, c.experts, h, c.intermediate, L.w.share.inter);
++        l.loop = null;
++        if (c.loop) |lp| if (i >= lp.start and i < lp.end) {
++            l.loop = try L.loopLayer(i, i - lp.start, lp.core());
++        };
+         return l;
+     }
++
++    /// A core layer's four message gates (whole on every rank) and its four cross-pass queries in q, k, v, MLP order.
++    fn loopLayer(L: *Loader, i: u32, j: u32, n_core: u32) !loop.Layer {
++        const h: usize = L.w.config.hidden;
++        if (h != loop.width) return error.UnsupportedInkling2Loop;
++        var out: loop.Layer = undefined;
++        inline for (.{ "attn", "k", "v", "mlp" }, 0..) |n, g| {
++            out.gates.down[g] = try L.put((try L.expect("layers.{d}.controllers." ++ n ++ ".down_weight", .{i}, .bf16, &.{ 64, 2 * h })).bytes);
++            out.gates.forget[g] = try L.put((try L.expect("layers.{d}.controllers." ++ n ++ ".forget_weight", .{i}, .bf16, &.{ h, 64 })).bytes);
++            out.gates.gain[g] = try L.put((try L.expect("layers.{d}.controllers." ++ n ++ ".gain_weight", .{i}, .bf16, &.{ h, 64 })).bytes);
++        }
++        const tq = try L.expect("middle_cycle_cross_pass_queries", .{}, .f32, &.{ 2 * n_core, h });
++        const tkv = try L.expect("middle_cycle_cross_pass_kv_queries", .{}, .f32, &.{ 2 * n_core, h });
++        var table: std.ArrayList(u8) = .empty;
++        defer table.deinit(L.gpa);
++        for ([_]visits.Stream{ .q, .k, .v, .mlp }) |st| {
++            const r = visits.queryRow(j, st);
++            const t = if (r.kv) tkv else tq;
++            try table.appendSlice(L.gpa, t.bytes[r.row * h * 4 ..][0 .. h * 4]);
++        }
++        out.queries = try L.put(table.items);
++        return out;
++    }
+ };
+ 
+ /// The rank's weights of `layers` (a prefix for a truncated pack), the embedding whole, its vocabulary's head rows.
+@@ -207,6 +238,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dense: *c
+     var w: Weights = .{ .gpa = gpa, .d = d, .config = c, .share = try shard.Share.of(&c, padded, rank, world), .padded_vocab = padded };
+     errdefer w.deinit();
+     var L: Loader = .{ .gpa = gpa, .w = &w, .ck = &ck, .sink = .{ .ctx = &w, .put = Weights.put, .dense = dense, .stream = stream } };
++    w.plan = visits.of(c.layers, c.block_layers, c.loop);
+     w.layers = try gpa.alloc(Layer, c.layers);
+     for (w.layers, 0..) |*l, i| {
+         l.* = try L.layer(@intCast(i));
+diff --git a/zig/tests/fixtures/gradient-serving.tsv b/zig/tests/fixtures/gradient-serving.tsv
+index fb4d203ab..6f61cd43a 100644
+--- a/zig/tests/fixtures/gradient-serving.tsv
++++ b/zig/tests/fixtures/gradient-serving.tsv
+@@ -93,7 +93,7 @@ zig/src/cuda/experts.zig	8bfc2f15a742cceba87dd7eb8e80f3f1b4e3f7eb323b557eb1bb4bf
+ zig/src/cuda/fp8.zig	a9caf312cb451dc95572b493e69ae211dd1e8b5be5b2c48cae3febd5d9327143	raw	series patches 65-pr-1024.patch; HELD: must be re-qualified by the LW device gates on the 1.1.1 candidate
+ zig/src/cuda/graph.zig	17639aaef0298c934b3f5ad3511925169c096ae57ede8ebee655faa838844f7b	raw
+ zig/src/cuda/grouped.zig	5fa1f39394b701eab59383bc7ed214ea3e17652a1229236df49f5281e6e764b5	raw	commits e1be0806d; HELD: must be re-qualified by the LW device gates on the 1.1.1 candidate
+-zig/src/cuda/kernels.zig	610862de1ba3cedf71bea42440c1b077277581af109ab4e1452c4b8bfe24f52a	raw	main 42735f94f0 (#2335: the mla image registered), f35900e60c (#2709: the dots_mocr image registered), #1630 (the experts_bf16 image registered), #2914 (covers: the release SM check), #1631 (the nemo_audio image registered), #1767 (the idol image registered), (Hy4-flash images registered); #1295: the six Muse Spark images registered; #3413 (the flashnext_hcn image registered); #4125: the inkling2_attn and inkling2_pattn images registered; the hy4_engram image registered (#4004); #4126: the inkling2_ops and inkling2_rows images registered; #1858: the idol_decoder image registered; inkling2: the experts, dspark and vision images registered
++zig/src/cuda/kernels.zig	c5ead0a97cc34827b14d73ca8d624ffd088ed03978187b200d1ba3145b38aa47	raw	main 42735f94f0 (#2335: the mla image registered), f35900e60c (#2709: the dots_mocr image registered), #1630 (the experts_bf16 image registered), #2914 (covers: the release SM check), #1631 (the nemo_audio image registered), #1767 (the idol image registered), (Hy4-flash images registered); #1295: the six Muse Spark images registered; #3413 (the flashnext_hcn image registered); #4125: the inkling2_attn and inkling2_pattn images registered; the hy4_engram image registered (#4004); #4126: the inkling2_ops and inkling2_rows images registered; #1858: the idol_decoder image registered; inkling2: the experts, dspark and vision images registered; the Mini loop image registered
+ zig/src/cuda/launch.zig	9ec64848834d82ddcea85a6123e975c95a5ae2bf85c2a71772244794b0bcd705	raw	series patches 14-runtime-foundation.patch; HELD: must be re-qualified by the LW device gates on the 1.1.1 candidate
+ zig/src/cuda/memory.zig	c140f1700e0f257a3ac09b1bfaa4a0d704d1922ccbffc3d453d75be0fef4b617	raw	commits 5dcf77d7c, f630f1a90, e9bf05ffd, 881cccaa4, a34cb6ded; series patches 14-runtime-foundation.patch; HELD: must be re-qualified by the LW device gates on the 1.1.1 candidate, this change (DeviceBuffer.allocVia allocates through a given hook; alloc is allocVia with the installed one, unchanged)
+ zig/src/cuda/modelopt.zig	648c9ba58197af0ce905f8792383502fc44a52c45d1413fe9e21d28d04c22253	raw
+-- 
+2.53.0
+

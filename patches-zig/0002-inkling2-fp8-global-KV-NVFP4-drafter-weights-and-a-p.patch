@@ -1,0 +1,1264 @@
+From 9bdb698dd0f553bdcf497c38a7181cee09a04ca8 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:03:51 +1100
+Subject: [PATCH 02/24] inkling2: fp8 global KV, NVFP4 drafter weights and a
+ profile mode as recipe switches
+
+The release build's levers, back as registered settings, all off by default:
+TF_INKLING2_KV=fp8 keeps the global layers' K/V as e4m3 with an fp32 scale a token and key head (decode, fold
+and prompt kernels read it bit for bit like the bf16 path), TF_INKLING2_DRAFT_WEIGHTS=nvfp4 quantises the
+drafter's projections at load, and TF_INKLING2_PROFILE=1 logs a round's phase times on each rank. The engine
+tool gains a timing mode.
+---
+ docs/environment.md                           |   3 +
+ zig/kernels/cuda/inkling2/attention.cu        | 136 +++++++++++++++++-
+ zig/kernels/cuda/inkling2/prompt_attention.cu | 120 +++++++++++++---
+ zig/src/families/inkling2/dspark.zig          |  19 ++-
+ zig/src/families/inkling2/dspark_quant.zig    |  90 ++++++++++++
+ zig/src/families/inkling2/engine.zig          |  12 +-
+ zig/src/families/inkling2/engine_main.zig     |   4 +-
+ zig/src/families/inkling2/engine_timing.zig   |  89 ++++++++++++
+ zig/src/families/inkling2/follow.zig          |   8 ++
+ zig/src/families/inkling2/forward.zig         |  23 ++-
+ zig/src/families/inkling2/inkling2.zig        |   2 +
+ zig/src/families/inkling2/kernels.zig         |  45 ++++--
+ zig/src/families/inkling2/kernels_test.zig    |  38 +++--
+ zig/src/families/inkling2/lanes.zig           |  12 ++
+ zig/src/families/inkling2/profile.zig         |  87 +++++++++++
+ zig/src/platform/environment.zig              |   3 +
+ zig/src/platform/environment_test.zig         |   3 +
+ 17 files changed, 648 insertions(+), 46 deletions(-)
+ create mode 100644 zig/src/families/inkling2/dspark_quant.zig
+ create mode 100644 zig/src/families/inkling2/engine_timing.zig
+ create mode 100644 zig/src/families/inkling2/profile.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 485f284f2..32754cea4 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -78,6 +78,9 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TF_MINIMAX_WORLD` | MiniMax-M3.1-Flash on CUDA: a whole rank count, 2 at CUDA, set with `TF_MINIMAX_RANK`; unset with it gives one rank |
+ | `TF_INKLING2_RANK` | Inkling 2 on CUDA: a whole rank index, 0 or 1 at two ranks, set with `TF_INKLING2_WORLD`; unset with it gives one rank |
+ | `TF_INKLING2_WORLD` | Inkling 2 on CUDA: a whole rank count, 2 on CUDA, set with `TF_INKLING2_RANK`; unset with it gives one rank |
++| `TF_INKLING2_KV` | Inkling 2 on CUDA: `fp8` stores the global layers' keys and values as e4m3 with an fp32 scale a token and key head (about half the bytes of a stream); `bf16` (default) keeps them in bf16. Sliding layers stay bf16 |
++| `TF_INKLING2_DRAFT_WEIGHTS` | Inkling 2 on CUDA: `nvfp4` quantises the bundled drafter's projections to NVFP4 at load (round to nearest); `bf16` (default) keeps them as released. Changes acceptance, never output |
++| `TF_INKLING2_PROFILE` | Inkling 2 on CUDA: `1` times a round's phases on each rank and logs a line every 200 rounds (syncs the forward; off by default) |
+ | `TF_PROMPT_ROWS` | Native serving: a multiple of 16 from 128 through 2048; unset keeps the chip/family default |
+ | `TF_ANE_COLUMNS` | Whole u32 count; zero disables the experimental share; default zero |
+ | `TF_METAL4` | Metal: exactly `0` or `1`; `1` sends a family's GPU work through Metal 4 (macOS 26 and later) where the family supports it: the same kernels in the same order, with Metal 4's command queue, allocators, argument tables and barriers, and bit-identical outputs; `0` keeps Metal 3. DeepSeek-V4.1 defaults to `1` where the Mac has Metal 4 (its device test rigs to `0`); Macs without it stay on Metal 3 |
+diff --git a/zig/kernels/cuda/inkling2/attention.cu b/zig/kernels/cuda/inkling2/attention.cu
+index 7ad9a1747..222ecdf0a 100644
+--- a/zig/kernels/cuda/inkling2/attention.cu
++++ b/zig/kernels/cuda/inkling2/attention.cu
+@@ -1,6 +1,7 @@
+ // Inkling 2 attention: q/k/v/rel preparation, the relative-bias table, chunked tensor-core attention and the merge.
+ #include <cstdint>
+ #include <cuda_bf16.h>
++#include <cuda_fp8.h>
+ 
+ #include "common/qmm_frag.cuh"
+ 
+@@ -42,7 +43,82 @@ __device__ __forceinline__ void clip(float* x, float thr) {
+     for (int i = 0; i < 4; ++i) x[i] *= f;
+ }
+ 
++// FP8 global caches (TF_INKLING2_KV=fp8): e4m3 [slot][kv_head][128] a stream, an fp32 scale (amax / 448) a slot+head.
++
++// Two e4m3 codes (the low bytes of v) as an exact bf16x2 pair: exponent rebiased by one bf16x2 multiply by 2^120.
++__device__ __forceinline__ uint32_t e4m3x2(uint32_t v) {
++    const uint32_t t = ((v & 0x7Fu) << 4) | ((v & 0x80u) << 8) | ((v & 0x7F00u) << 12) | ((v & 0x8000u) << 16);
++    uint32_t r;
++    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7B807B80u), "r"(0x80008000u));
++    return r;
++}
++
++// Four codes times the row's scale, rounded once to bf16 (fp32 products).
++__device__ __forceinline__ uint2 deq4(uint32_t w, float s) {
++    uint2 o;
++    const uint32_t a = e4m3x2(w), b = e4m3x2(w >> 16);
++    const float a1 = __uint_as_float(a & 0xFFFF0000u) * s, a0 = __uint_as_float(a << 16) * s;
++    const float b1 = __uint_as_float(b & 0xFFFF0000u) * s, b0 = __uint_as_float(b << 16) * s;
++    asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(o.x) : "f"(a1), "f"(a0));
++    asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(o.y) : "f"(b1), "f"(b0));
++    return o;
++}
++
++// A 64-key fp8 tile in registers, 128 threads x 4 pieces of 16 codes (key e >> 3, columns (e & 7) * 16).
++struct Raw8 {
++    uint4 b[4];
++    float s[4];
++};
++
++// Keys kt..kt+63 of key head kvh of an fp8 cache (a stream's bytes at `off`) into registers; zero outside k_lo..k_hi.
++__device__ __forceinline__ void fetch8(Raw8& r, const uint8_t* __restrict__ c, const float* __restrict__ sc,
++                                       long long off, int kv_heads, int ring, int kvh, int kt, int k_lo, int k_hi) {
++    for (int i = 0; i < 4; ++i) {
++        const int e = threadIdx.x + 128 * i, kp = kt + (e >> 3);
++        r.b[i] = make_uint4(0, 0, 0, 0);
++        r.s[i] = 0.0f;
++        if (kp >= k_lo && kp <= k_hi) {
++            const size_t row = static_cast<size_t>(kp % ring) * kv_heads + kvh;
++            r.b[i] = *reinterpret_cast<const uint4*>(c + off + row * kDim + (e & 7) * 16);
++            r.s[i] = sc[off / kDim + row];
++        }
++    }
++}
++
++// The fetched tile as bf16 rows [64][kPad] in shared memory (zeros stay zeros: masked p = 0 never meets garbage).
++__device__ __forceinline__ void store8(const Raw8& r, uint16_t* dst) {
++    for (int i = 0; i < 4; ++i) {
++        const int e = threadIdx.x + 128 * i;
++        uint4* d = reinterpret_cast<uint4*>(dst + (e >> 3) * kPad + (e & 7) * 16);
++        const uint2 a = deq4(r.b[i].x, r.s[i]), b = deq4(r.b[i].y, r.s[i]);
++        const uint2 c = deq4(r.b[i].z, r.s[i]), e2 = deq4(r.b[i].w, r.s[i]);
++        d[0] = make_uint4(a.x, a.y, b.x, b.y);
++        d[1] = make_uint4(c.x, c.y, e2.x, e2.y);
++    }
++}
++
++// One tensor's (K or V) 64-key fp8 tile to bf16 shared rows, for blocks of 128 threads: the one dequantise path.
++__device__ __forceinline__ void tile8(const uint8_t* __restrict__ c, const float* __restrict__ sc, long long off,
++                                      int kv_heads, int ring, int kvh, int kt, int k_lo, int k_hi, uint16_t* dst) {
++    Raw8 r;
++    fetch8(r, c, sc, off, kv_heads, ring, kvh, kt, k_lo, k_hi);
++    store8(r, dst);
++}
++
++// One token-head row (4 values a lane) to e4m3 at `dst` with its scale (lane 0); a zero row stores zeros.
++__device__ __forceinline__ void put8(const float* x, uint8_t* dst, float* scale, int lane) {
++    float amax = fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3])));
++    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++    const float inv = amax > 0.0f ? __fdiv_rn(448.0f, amax) : 0.0f;
++    uint32_t w = 0;
++    for (int i = 0; i < 4; ++i)
++        w |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(__fmul_rn(x[i], inv), __NV_SATFINITE, __NV_E4M3)) << (8 * i);
++    *reinterpret_cast<uint32_t*>(dst + lane * 4) = w;
++    if (lane == 0) *scale = amax > 0.0f ? __fdiv_rn(amax, 448.0f) : 0.0f;
++}
++
+ // Per row and head: q = clip(q * q_scale) (* tau), rel = clip(rel * rel_scale) (* tau), k = clip(k), v = rms(v).
++template <bool KV8>
+ __device__ __forceinline__ void prepRow(const uint16_t* __restrict__ q_raw, const uint16_t* __restrict__ k_raw,
+                                         const uint16_t* __restrict__ v_raw, const uint16_t* __restrict__ rel_raw,
+                                         const uint16_t* __restrict__ q_scale, const uint16_t* __restrict__ rel_scale,
+@@ -50,7 +126,8 @@ __device__ __forceinline__ void prepRow(const uint16_t* __restrict__ q_raw, cons
+                                         const Seg* __restrict__ segs, uint16_t* __restrict__ q_out,
+                                         uint16_t* __restrict__ rel_out, uint16_t* __restrict__ kc,
+                                         uint16_t* __restrict__ vc, int heads, int kv_heads, int ring, int global,
+-                                        float qk_clip, float rel_clip, float floor_pos, float alpha, float eps) {
++                                        float qk_clip, float rel_clip, float floor_pos, float alpha, float eps,
++                                        float* __restrict__ ksc, float* __restrict__ vsc) {
+ 
+     const int row = blockIdx.x, y = blockIdx.y, lane = threadIdx.x;
+     const int pos = rpos[row];
+@@ -84,6 +161,13 @@ __device__ __forceinline__ void prepRow(const uint16_t* __restrict__ q_raw, cons
+         for (int i = 0; i < 4; ++i) x[i] *= r;
+     }
+     const Seg s = segs[rseg[row]];
++    if (KV8) {  // the bf16 value, as the bf16 cache would hold it, to e4m3
++        for (int i = 0; i < 4; ++i) x[i] = bf(tobf(x[i]));
++        const size_t at = static_cast<size_t>(pos % ring) * kv_heads + h;
++        put8(x, reinterpret_cast<uint8_t*>(key ? kc : vc) + s.off + at * kDim, (key ? ksc : vsc) + s.off / kDim + at,
++             lane);
++        return;
++    }
+     uint16_t* dst = (key ? kc : vc) + s.off + (static_cast<size_t>(h) * ring + pos % ring) * kDim;
+     for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = tobf(x[i]);
+ }
+@@ -104,7 +188,12 @@ using ink2::Seg;
+         ring, global, qk_clip, rel_clip, floor_pos, alpha, eps
+ 
+ extern "C" __global__ void tf_ink2_prep(TF_INK2_PREP_ARGS) {
+-    ink2::prepRow(TF_INK2_PREP_PASS);
++    ink2::prepRow<false>(TF_INK2_PREP_PASS, nullptr, nullptr);
++}
++
++// The same for a global layer whose caches are fp8: k and v stored as e4m3 rows plus their scales.
++extern "C" __global__ void tf_ink2_prep8(TF_INK2_PREP_ARGS, float* __restrict__ ksc, float* __restrict__ vsc) {
++    ink2::prepRow<true>(TF_INK2_PREP_PASS, ksc, vsc);
+ }
+ 
+ // tab[row, head, d] = bf16(rel[row, head, :] . proj[:, d]) for d < 1024, fp32 sums in tap order (rel_logits_proj).
+@@ -140,13 +229,15 @@ __device__ __forceinline__ float scaled(float o, float a, float p, float b) {
+ }
+ 
+ // 64 (row, head) pairs of a key head over a block's keys (FOLD: a global chunk, split: a sub-chunk, else a chunk).
+-template <bool FOLD>
++template <bool FOLD, bool KV8 = false>
+ __device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
+                                          const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab,
+                                          const Seg* __restrict__ segs, const int2* __restrict__ tiles,
+                                          float* __restrict__ part_o, float2* __restrict__ part_ml, int heads,
+                                          int kv_heads, int ring, int window, int chunk, int c0, int chunks,
+-                                         float scale, int split, uint16_t* ks, uint16_t* vs) {
++                                         float scale, int split, uint16_t* ks, uint16_t* vs,
++                                         const float* __restrict__ ksc = nullptr,
++                                         const float* __restrict__ vsc = nullptr) {
+     const int2 tile = tiles[blockIdx.x];
+     const Seg s = segs[tile.x];
+     const int group = heads / kv_heads;
+@@ -205,7 +296,14 @@ __device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const u
+         for (int kt = k_lo & ~(kKeys - 1); kt <= k_hi; kt += kKeys) {
+             __syncthreads();
+             const size_t slot0 = static_cast<size_t>(kt % ring);
+-            for (int e = threadIdx.x; e < kKeys * (kDim / 8); e += 128) {
++            if (KV8) {  // both tensors' loads in flight before either is converted (tile8's halves)
++                Raw8 rk, rv;
++                fetch8(rk, reinterpret_cast<const uint8_t*>(kc), ksc, s.off, kv_heads, ring, kvh, kt, k_lo, k_hi);
++                fetch8(rv, reinterpret_cast<const uint8_t*>(vc), vsc, s.off, kv_heads, ring, kvh, kt, k_lo, k_hi);
++                store8(rk, ks);
++                store8(rv, vs);
++            }
++            for (int e = threadIdx.x; !KV8 && e < kKeys * (kDim / 8); e += 128) {
+                 const int key = e >> 4, col = (e & 15) * 8;
+                 const int kp = kt + key;
+                 uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+@@ -324,6 +422,20 @@ extern "C" __global__ void __launch_bounds__(128)
+                     scale, split, ks, vs);
+ }
+ 
++// Split global calls on fp8 caches (TF_INKLING2_KV=fp8): tiles dequantised to bf16 at load, the rest as tf_ink2_attn.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_attn8(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
++                  const uint16_t* __restrict__ tab, const Seg* __restrict__ segs, const int2* __restrict__ tiles,
++                  float* __restrict__ part_o, float2* __restrict__ part_ml, int heads, int kv_heads, int ring,
++                  int window, int chunk, int c0, int chunks, float scale, int split, const float* __restrict__ ksc,
++                  const float* __restrict__ vsc) {
++    using namespace ink2;
++    __shared__ __align__(16) uint16_t ks[kKeys * kPad];
++    __shared__ __align__(16) uint16_t vs[kKeys * kPad];
++    attnTile<false, true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk, c0,
++                          chunks, scale, split, ks, vs, ksc, vsc);
++}
++
+ // Global layers a chunk a block, its sub-chunks folded in order (prompt calls: no partial a sub-chunk).
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_ink2_attn_fold(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
+@@ -337,6 +449,20 @@ extern "C" __global__ void __launch_bounds__(128)
+                    0, ks, vs);
+ }
+ 
++// The fold path on fp8 caches.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_attn_fold8(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
++                       const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab, const Seg* __restrict__ segs,
++                       const int2* __restrict__ tiles, float* __restrict__ part_o, float2* __restrict__ part_ml,
++                       int heads, int kv_heads, int ring, int chunk, int c0, int chunks, float scale,
++                       const float* __restrict__ ksc, const float* __restrict__ vsc) {
++    using namespace ink2;
++    __shared__ __align__(16) uint16_t ks[kKeys * kPad];
++    __shared__ __align__(16) uint16_t vs[kKeys * kPad];
++    attnTile<true, true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, 0, chunk, c0, chunks,
++                         scale, 0, ks, vs, ksc, vsc);
++}
++
+ // Per (row, head): its chunks folded in order (subs > 1: each from its sub-chunks first), the sink, then the gate.
+ extern "C" __global__ void tf_ink2_merge(const float* __restrict__ part_o, const float2* __restrict__ part_ml,
+                                          const uint16_t* __restrict__ sink, const uint16_t* __restrict__ gate,
+diff --git a/zig/kernels/cuda/inkling2/prompt_attention.cu b/zig/kernels/cuda/inkling2/prompt_attention.cu
+index 97a03657d..da1fc3b7f 100644
+--- a/zig/kernels/cuda/inkling2/prompt_attention.cu
++++ b/zig/kernels/cuda/inkling2/prompt_attention.cu
+@@ -65,12 +65,66 @@ __device__ __forceinline__ void loadTile(uint16_t* ks, uint16_t* vs, const uint1
+     tf_common::cp_commit();
+ }
+ 
+-// A block's prompt pairs (tile of kPairs pairs, key head, chunk).
+-__device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
+-                                           const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab,
++// An f16 (low half of h) as fp32, exact.
++__device__ __forceinline__ float h2f(uint32_t h) {
++    float f;
++    asm("cvt.f32.f16 %0, %1;\n" : "=f"(f) : "h"(static_cast<unsigned short>(h)));
++    return f;
++}
++
++// Four codes times the row's scale, rounded once to bf16: tile8's values for every finite code (exact f16 unpack).
++__device__ __forceinline__ uint2 deq4(uint32_t w, float s) {
++    uint32_t p, q;
++    asm("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(p) : "h"(static_cast<unsigned short>(w & 0xFFFFu)));
++    asm("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(q) : "h"(static_cast<unsigned short>(w >> 16)));
++    const float a0 = h2f(p) * s, a1 = h2f(p >> 16) * s, b0 = h2f(q) * s, b1 = h2f(q >> 16) * s;
++    uint2 o;
++    asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(o.x) : "f"(a1), "f"(a0));
++    asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(o.y) : "f"(b1), "f"(b0));
++    return o;
++}
++
++// fp8 caches: a stage's raw bytes, K then V, 512 pieces of 16 codes each (piece e: key e >> 3, codes (e & 7) * 16).
++constexpr int kRaw = 2 * kKeys * kDim;
++
++// Keys kt..kt+63 of fp8 caches into raw stage `raw` (async, each thread its own 4 pieces), their scales into sc.
++__device__ __forceinline__ void issue8(uint8_t* raw, float* sc, const uint8_t* __restrict__ kc,
++                                       const uint8_t* __restrict__ vc, const float* __restrict__ ksc,
++                                       const float* __restrict__ vsc, long long off, int kv_heads, int ring,
++                                       int kvh, int kt, int k_lo, int k_hi) {
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const int e = threadIdx.x + kThreads * (i & 1), kp = kt + (e >> 3);
++        const bool in = kp >= k_lo && kp <= k_hi;
++        const size_t row = in ? static_cast<size_t>(kp % ring) * kv_heads + kvh : 0;
++        const uint8_t* src = (i < 2 ? kc : vc) + off + (in ? row * kDim + (e & 7) * 16 : 0);
++        tf_common::cp16z(raw + (i >> 1) * kKeys * kDim + e * 16, src, in);
++        sc[i] = in ? (i < 2 ? ksc : vsc)[off / kDim + row] : 0.0f;
++    }
++    tf_common::cp_commit();
++}
++
++// This thread's pieces of raw stage `raw` as bf16 into the swizzled K/V tiles at `ks` (tile8's values, bit for bit).
++__device__ __forceinline__ void convert8(const uint8_t* raw, const float* sc, uint16_t* ks) {
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const int e = threadIdx.x + kThreads * (i & 1), key = e >> 3;
++        const uint4 w = *reinterpret_cast<const uint4*>(raw + (i >> 1) * kKeys * kDim + e * 16);
++        const uint2 a = deq4(w.x, sc[i]), b = deq4(w.y, sc[i]), c = deq4(w.z, sc[i]), d = deq4(w.w, sc[i]);
++        uint16_t* t = ks + (i >> 1) * kTile;
++        *reinterpret_cast<uint4*>(t + piece(key, 2 * (e & 7))) = make_uint4(a.x, a.y, b.x, b.y);
++        *reinterpret_cast<uint4*>(t + piece(key, 2 * (e & 7) + 1)) = make_uint4(c.x, c.y, d.x, d.y);
++    }
++}
++
++// A block's prompt pairs (tile of kPairs pairs, key head, chunk); KV8: raw fp8 in two stages, two bf16 tiles.
++template <bool KV8>
++__device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const void* __restrict__ kc,
++                                           const void* __restrict__ vc, const uint16_t* __restrict__ tab,
+                                            const Seg* __restrict__ segs, float* __restrict__ part_o,
+                                            float2* __restrict__ part_ml, int heads, int kv_heads, int ring,
+-                                           int chunk, int c0, int chunks, float scale, uint16_t* smem) {
++                                           int chunk, int c0, int chunks, float scale, const float* __restrict__ ksc,
++                                           const float* __restrict__ vsc, uint16_t* smem) {
+     const Seg s = segs[0];
+     const int group = heads / kv_heads;
+     const int total = s.n * group;
+@@ -115,9 +169,22 @@ __device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const
+     // ldmatrix lanes: K rows 8j + (lane & 7), pieces 2k + lane / 8; V rows 16u + lane % 16, pieces n + lane / 16
+     const int k_row = lane & 7, k_pc = lane >> 3;
+     const int v_row = lane & 15, v_pc = lane >> 4;
+-    const uint16_t* k16 = kc;
+-    const uint16_t* v16 = vc;
+-    for (int st = 0; st < kStages - 1; ++st) {
++    const uint16_t* k16 = static_cast<const uint16_t*>(kc);
++    const uint16_t* v16 = static_cast<const uint16_t*>(vc);
++    const uint8_t* k8 = static_cast<const uint8_t*>(kc);
++    const uint8_t* v8 = static_cast<const uint8_t*>(vc);
++    uint8_t* raw = reinterpret_cast<uint8_t*>(smem + 2 * kStage);  // KV8: two raw stages after the two bf16 tiles
++    float cur[4], nxt[4];  // KV8: scales of the next tile to convert, and of the one after
++    if (KV8) {
++        issue8(raw, cur, k8, v8, ksc, vsc, s.off, kv_heads, ring, kvh, b_lo, b_lo, k_hi);
++        if (n_tiles > 1)
++            issue8(raw + kRaw, nxt, k8, v8, ksc, vsc, s.off, kv_heads, ring, kvh, b_lo + kKeys, b_lo, k_hi);
++        else tf_common::cp_commit();
++        tf_common::cp_wait<1>();
++        convert8(raw, cur, smem);
++        for (int i = 0; i < 4; ++i) cur[i] = nxt[i];
++    }
++    for (int st = 0; !KV8 && st < kStages - 1; ++st) {
+         if (st < n_tiles) loadTile(smem + st * kStage, smem + st * kStage + kTile, k16, v16, head_base, ring,
+                                    b_lo + st * kKeys, b_lo, k_hi);
+         else tf_common::cp_commit();
+@@ -130,15 +197,22 @@ __device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const
+             m[0] = m[1] = -INFINITY;
+             l[0] = l[1] = 0.0f;
+         }
+-        tf_common::cp_wait<kStages - 2>();
+-        __syncthreads();  // tile `it` is in; every warp is past tile it-1, whose stage the next load takes
+-        if (it + kStages - 1 < n_tiles) {
+-            uint16_t* nx = smem + ((it + kStages - 1) % kStages) * kStage;
+-            loadTile(nx, nx + kTile, k16, v16, head_base, ring, kt + (kStages - 1) * kKeys, b_lo, k_hi);
++        if (KV8) {
++            __syncthreads();  // tile `it` is converted; every warp is past tile it-1 and its raw stage
++            if (it + 2 < n_tiles) issue8(raw + (it % 2) * kRaw, nxt, k8, v8, ksc, vsc, s.off, kv_heads, ring, kvh,
++                                         kt + 2 * kKeys, b_lo, k_hi);
++            else tf_common::cp_commit();
+         } else {
+-            tf_common::cp_commit();
++            tf_common::cp_wait<kStages - 2>();
++            __syncthreads();  // tile `it` is in; every warp is past tile it-1, whose stage the next load takes
++            if (it + kStages - 1 < n_tiles) {
++                uint16_t* nx = smem + ((it + kStages - 1) % kStages) * kStage;
++                loadTile(nx, nx + kTile, k16, v16, head_base, ring, kt + (kStages - 1) * kKeys, b_lo, k_hi);
++            } else {
++                tf_common::cp_commit();
++            }
+         }
+-        const uint16_t* ks = smem + (it % kStages) * kStage;
++        const uint16_t* ks = smem + (it % (KV8 ? 2 : kStages)) * kStage;
+         const uint16_t* vs = ks + kTile;
+         if (busy && kt <= w_last) {  // a tile past all of a warp's rows is an exact no-op
+             float sc[8][4];
+@@ -211,6 +285,11 @@ __device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const
+                 }
+             }
+         }
++        if (KV8 && it + 1 < n_tiles) {  // tile it+1's own bytes are in: to the bf16 tile computed next
++            tf_common::cp_wait<1>();
++            convert8(raw + ((it + 1) % 2) * kRaw, cur, smem + ((it + 1) % 2) * kStage);
++            for (int i = 0; i < 4; ++i) cur[i] = nxt[i];
++        }
+         if (busy && (it % (kSub / kKeys) == kSub / kKeys - 1 || it == n_tiles - 1)) {
+             for (int i = 0; i < 2; ++i) {
+                 l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+@@ -239,12 +318,21 @@ __device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const
+ }  // namespace ink2p
+ 
+ #define TF_INK2_PROMPT_ARGS                                                                                       \
+-    const uint16_t *__restrict__ q, const uint16_t *__restrict__ kc, const uint16_t *__restrict__ vc,             \
++    const uint16_t *__restrict__ q, const void *__restrict__ kc, const void *__restrict__ vc,                     \
+         const uint16_t *__restrict__ tab, const ink2p::Seg *__restrict__ segs, float *__restrict__ part_o,      \
+         float2 *__restrict__ part_ml, int heads, int kv_heads, int ring, int chunk, int c0, int chunks, float scale
+ 
+ // One stream's prompt rows on a global layer with bf16 caches.
+ extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1) tf_ink2_attn_prompt(TF_INK2_PROMPT_ARGS) {
+     extern __shared__ __align__(16) uint16_t smem[];
+-    ink2p::promptTile(q, kc, vc, tab, segs, part_o, part_ml, heads, kv_heads, ring, chunk, c0, chunks, scale, smem);
++    ink2p::promptTile<false>(q, kc, vc, tab, segs, part_o, part_ml, heads, kv_heads, ring, chunk, c0, chunks, scale,
++                             nullptr, nullptr, smem);
++}
++
++// The same on fp8 caches (TF_INKLING2_KV=fp8): tiles dequantised as tf_ink2_attn8's, so the same bits.
++extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1)
++    tf_ink2_attn_prompt8(TF_INK2_PROMPT_ARGS, const float* __restrict__ ksc, const float* __restrict__ vsc) {
++    extern __shared__ __align__(16) uint16_t smem[];
++    ink2p::promptTile<true>(q, kc, vc, tab, segs, part_o, part_ml, heads, kv_heads, ring, chunk, c0, chunks, scale,
++                            ksc, vsc, smem);
+ }
+diff --git a/zig/src/families/inkling2/dspark.zig b/zig/src/families/inkling2/dspark.zig
+index e88043b3c..a09995e7e 100644
+--- a/zig/src/families/inkling2/dspark.zig
++++ b/zig/src/families/inkling2/dspark.zig
+@@ -4,6 +4,7 @@ const cuda = @import("cuda");
+ const core = @import("core");
+ const cfg = @import("shape.zig");
+ const weights = @import("weights.zig");
++const quant = @import("dspark_quant.zig");
+ 
+ /// The drafter's file beside the pack's shards (the release ships it at the checkpoint's top level).
+ pub const file = "mtp.safetensors";
+@@ -141,6 +142,7 @@ const Loader = struct {
+     d: *const cuda.Driver,
+     w: *Weights,
+     ck: *core.Checkpoint,
++    fp4: bool = false, // TF_INKLING2_DRAFT_WEIGHTS=nvfp4: the projections quantised at load (dspark_quant.zig)
+     buf: [160]u8 = undefined,
+ 
+     fn get(L: *Loader, comptime fmt: []const u8, args: anytype, dims: []const usize) !core.checkpoint.Tensor {
+@@ -184,6 +186,18 @@ const Loader = struct {
+     }
+ 
+     fn pack(L: *Loader, host: []const u16, n: usize, k: usize) !cuda.qmmf.Weight {
++        if (L.fp4) {
++            var q = try quant.quantise(L.gpa, host, n, k);
++            defer q.deinit(L.gpa);
++            const words = try L.gpa.alloc(u32, cuda.nvfp4.padded(n) / 64 * (k / cuda.nvfp4.group) * 512);
++            defer L.gpa.free(words);
++            const tiles = try L.gpa.alloc(u8, cuda.nvfp4.padded(n) * (k / 16));
++            defer L.gpa.free(tiles);
++            cuda.nvfp4.packWords(words, q.codes, n, k);
++            cuda.nvfp4.packScales(tiles, q.scales, n, k);
++            const wp = try L.w.put(L.gpa, L.d, std.mem.sliceAsBytes(words));
++            return cuda.nvfp4.weight(wp, try L.w.put(L.gpa, L.d, tiles), q.global, n, k);
++        }
+         const npad = (n + 127) / 128 * 128;
+         const tiles = try L.gpa.alloc(u16, npad * k);
+         defer L.gpa.free(tiles);
+@@ -201,7 +215,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []co
+     try ck.add(dir, file);
+     var w: Weights = .{ .c = c };
+     errdefer w.deinit(gpa);
+-    var L: Loader = .{ .gpa = gpa, .d = d, .w = &w, .ck = &ck };
++    comptime @import("sys").environment.registered("TF_INKLING2_DRAFT_WEIGHTS");
++    const fp4 = try @import("sys").environment.read(u64, "TF_INKLING2_DRAFT_WEIGHTS", 0) == 1;
++    if (fp4) std.log.info("inkling2 drafter: projections as NVFP4 (TF_INKLING2_DRAFT_WEIGHTS)", .{});
++    var L: Loader = .{ .gpa = gpa, .d = d, .w = &w, .ck = &ck, .fp4 = fp4 };
+     const h: usize = tc.hidden;
+     const s = t.share;
+     const D = 128;
+diff --git a/zig/src/families/inkling2/dspark_quant.zig b/zig/src/families/inkling2/dspark_quant.zig
+new file mode 100644
+index 000000000..155cd9412
+--- /dev/null
++++ b/zig/src/families/inkling2/dspark_quant.zig
+@@ -0,0 +1,90 @@
++//! The drafter's bf16 projections as NVFP4 at load (TF_INKLING2_DRAFT_WEIGHTS=nvfp4): changes acceptance, never output.
++const std = @import("std");
++const core = @import("core");
++
++const fp8 = core.quant.fp8;
++const fp4 = core.quant.nvfp4;
++
++pub const Quantised = struct {
++    codes: []u8, // [n, k/2], even inputs in the low nibble
++    scales: []u8, // e4m3 [n, k/16]
++    global: f32,
++
++    pub fn deinit(q: *Quantised, gpa: std.mem.Allocator) void {
++        gpa.free(q.codes);
++        gpa.free(q.scales);
++    }
++};
++
++/// The e4m3 byte of a value toE4m3 already rounded (0 <= x <= 448).
++fn e4m3Byte(x: f64) u8 {
++    if (x == 0) return 0;
++    if (x < 1.0 / 64.0) return @intFromFloat(@round(x * 512)); // subnormals: steps of 2^-9
++    const e = std.math.floor(std.math.log2(x));
++    const m: u8 = @intFromFloat(@round((x / std.math.pow(f64, 2, e) - 1) * 8));
++    return @as(u8, @intFromFloat(e + 7)) << 3 | m;
++}
++
++/// The nearest e2m1 nibble to x (ties to the even code), saturating at +-6.
++fn e2m1Code(x: f32) u8 {
++    const mags = [8]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
++    const a = @abs(x);
++    var best: u8 = 0;
++    for (mags, 0..) |m, i| {
++        const d = @abs(a - m);
++        const b = @abs(a - mags[best]);
++        if (d < b or (d == b and i % 2 == 0)) best = @intCast(i);
++    }
++    return if (x < 0 and best != 0) best | 8 else best;
++}
++
++fn bf(v: u16) f32 {
++    return @bitCast(@as(u32, v) << 16);
++}
++
++/// bf16 [n, k] (k a multiple of 16) as NVFP4: global = amax / (6 x 448), each block's scale its amax / 6 / global.
++pub fn quantise(gpa: std.mem.Allocator, w: []const u16, n: usize, k: usize) !Quantised {
++    std.debug.assert(w.len == n * k and k % 16 == 0);
++    var amax: f32 = 0;
++    for (w) |v| amax = @max(amax, @abs(bf(v)));
++    const global: f32 = if (amax > 0) amax / (6.0 * 448.0) else 1.0;
++    const codes = try gpa.alloc(u8, n * k / 2);
++    errdefer gpa.free(codes);
++    const scales = try gpa.alloc(u8, n * k / 16);
++    for (0..n * k / 16) |b| {
++        const blk = w[b * 16 ..][0..16];
++        var bmax: f32 = 0;
++        for (blk) |v| bmax = @max(bmax, @abs(bf(v)));
++        const s = fp8.toE4m3(bmax / 6.0 / global);
++        scales[b] = e4m3Byte(s);
++        const step: f32 = @floatCast(fp8.e4m3(scales[b]) * global);
++        for (0..8) |p| {
++            const lo = if (step > 0) e2m1Code(bf(blk[2 * p]) / step) else 0;
++            const hi = if (step > 0) e2m1Code(bf(blk[2 * p + 1]) / step) else 0;
++            codes[b * 8 + p] = lo | hi << 4;
++        }
++    }
++    return .{ .codes = codes, .scales = scales, .global = global };
++}
++
++test "dspark_quant: e4m3 bytes round-trip, e2m1 rounds to nearest, a matrix decodes within half a step" {
++    for (0..0x7f) |b| try std.testing.expectEqual(@as(u8, @intCast(b)), e4m3Byte(fp8.e4m3(@intCast(b))));
++    try std.testing.expectEqual(@as(u8, 0x6), e2m1Code(4.4)); // 4
++    try std.testing.expectEqual(@as(u8, 0x7), e2m1Code(5.1)); // 6
++    try std.testing.expectEqual(@as(u8, 0xb), e2m1Code(-1.4)); // -1.5
++    try std.testing.expectEqual(@as(u8, 0x7), e2m1Code(9.0)); // saturates at 6
++    const n = 3;
++    const k = 64;
++    var w: [n * k]u16 = undefined;
++    var rng = std.Random.DefaultPrng.init(7);
++    for (&w) |*v| v.* = @truncate(@as(u32, @bitCast(rng.random().floatNorm(f32) * 0.02)) >> 16);
++    var q = try quantise(std.testing.allocator, &w, n, k);
++    defer q.deinit(std.testing.allocator);
++    for (0..n * k) |i| {
++        const s = fp8.e4m3(q.scales[i / 16]) * q.global;
++        const nib = (q.codes[i / 2] >> @intCast(4 * (i % 2))) & 0xF;
++        const back = fp4.e2m1(nib) * s;
++        // the widest e2m1 gap is 2 (4 to 6): within one step of the block scale, and a block's largest is kept close
++        try std.testing.expect(@abs(back - bf(w[i])) <= s + 1e-9);
++    }
++}
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 67a6ba204..128fd7cef 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -13,6 +13,7 @@ const drun = @import("dspark_run.zig");
+ const vision = @import("vision.zig");
+ const image = @import("image.zig");
+ const pictures = @import("pictures.zig");
++const prof = @import("profile.zig");
+ 
+ /// Rows a prompt chunk holds (the prompt cache's mark grid) and a stream's window at most.
+ pub const prompt_rows = 2048;
+@@ -88,6 +89,7 @@ pub const Engine = struct {
+         const e = try gpa.create(Engine);
+         errdefer gpa.destroy(e);
+         const c = try cfg.Config.read(gpa, io, dir);
++        try prof.start(io, rank);
+         var stream = try cuda.Stream.init(d, false);
+         errdefer stream.deinit();
+         var m = try fw.Modules.load(d);
+@@ -97,8 +99,9 @@ pub const Engine = struct {
+         errdefer e.w.deinit();
+         const heads = e.w.share.heads.len();
+         const kv = e.w.share.kv.len();
+-        e.shape_p = .{ .rows = prompt_rows, .context = o.capacity, .heads = heads, .kv = kv };
+-        e.shape_d = .{ .rows = shared_rows, .context = o.capacity, .heads = heads, .kv = kv, .ring_rows = prompt_rows, .hist = true };
++        const kv8 = try fw.kvSetting();
++        e.shape_p = .{ .rows = prompt_rows, .context = o.capacity, .heads = heads, .kv = kv, .kv8 = kv8 };
++        e.shape_d = .{ .rows = shared_rows, .context = o.capacity, .heads = heads, .kv = kv, .ring_rows = prompt_rows, .hist = true, .kv8 = kv8 };
+         errdefer for (e.parts.items) |*b| b.free();
+         const slots = @max(prompt_rows * heads * prompt_parts, shared_rows * heads * fw.stride(&e.c, o.capacity - 1));
+         const shared = try fw.partialsFor(d, &e.parts, gpa, slots);
+@@ -324,6 +327,7 @@ pub const Engine = struct {
+             if (p.ids.len > 1) try e.convCopy(p.slot, true);
+             rows += p.ids.len;
+         }
++        const p0 = if (prof.global.on) prof.global.now() else 0;
+         const f = e.forward(&e.bd, e.shape_d);
+         const plan = try f.stage(st, items[0..parts.len]);
+         const Body = struct {
+@@ -339,6 +343,9 @@ pub const Engine = struct {
+         const key: Key = .{ .n = @intCast(plan.n), .ni = @intCast(plan.ni), .nt = @intCast(plan.nt), .stride = plan.stride };
+         const print = cuda.graph_cache.fingerprintOf(&.{ st.kc[0], e.bd.ids.ptr, e.bd.parts.o });
+         _ = try e.graphs.run(key, e.stream, print, .{ .ctx = &body, .run = Body.run });
++        if (prof.global.on) try e.stream.synchronize(); // profiling only: the forward timed apart from the draws
++        prof.global.add(.forward, p0);
++        const p1 = if (prof.global.on) prof.global.now() else 0;
+         e.calls += 1;
+         fw.Forward.advance(st, items[0..parts.len]);
+         var row: usize = 0;
+@@ -351,6 +358,7 @@ pub const Engine = struct {
+             try e.draw(&e.bd, row, p.ids.len, st.pos[p.slot] - p.ids.len + 1, e.seqs[p.slot].sampling, p.out[0..p.ids.len]);
+             row += p.ids.len;
+         }
++        prof.global.add(.draws, p1);
+     }
+ 
+     /// The bound slot's last window keeps its first `n` rows: past them its conv states and length go back.
+diff --git a/zig/src/families/inkling2/engine_main.zig b/zig/src/families/inkling2/engine_main.zig
+index f48a374e5..22e5eef73 100644
+--- a/zig/src/families/inkling2/engine_main.zig
++++ b/zig/src/families/inkling2/engine_main.zig
+@@ -3,11 +3,12 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const ink = @import("inkling2");
+ 
+-const usage = "usage: tf-inkling2-engine graphs|greedy|drafted|drafts|images <model dir> <ids.json> <out dir> [context] [new]\n" ++
++const usage = "usage: tf-inkling2-engine graphs|greedy|drafted|drafts|images|timing <model dir> <ids.json> <out dir> [context] [new]\n" ++
+     "  graphs: decode windows eager in some slots and graphed in others on the same rows; logits must match bit for bit\n" ++
+     "  greedy: each text's prompt pass then greedy decode rows, eager (writes greedy.json: name -> tokens)\n" ++
+     "  drafts: the drafter at ~12 anchors a text after a prompt pass to each (drafts.json, drafts-r<rank>.bin)\n" ++
+     "  images: <ids.json> is a directory of NAME.png + NAME.ids.u32; spliced rows, solo/drafted/concurrent greedy\n" ++
++    "  timing: graphed windows by rows and streams, draft passes, a short keep (median ms of 16 after 3 warm)\n" ++
+     "  two ranks: TF_INKLING2_RANK, TF_INKLING2_WORLD and NCCL_COMM_ID on both\n";
+ 
+ const Text = struct { name: []const u8, ids: []u32 };
+@@ -61,6 +62,7 @@ pub fn main(init: std.process.Init) !u8 {
+     const r0 = place.rank == 0;
+     if (std.mem.eql(u8, args[1], "drafts")) return drafts(e, a, io, out, list.items, place.rank);
+     if (pics) return @import("engine_images.zig").run(e, a, io, args[3], out, new, r0);
++    if (std.mem.eql(u8, args[1], "timing")) return @import("engine_timing.zig").run(e, a, io, list.items, r0);
+     if (std.mem.eql(u8, args[1], "drafted")) {
+         var bad: usize = 0;
+         // drafted.json: each text's plain tokens and, from the eager arm, how many rows each window kept (1-8)
+diff --git a/zig/src/families/inkling2/engine_timing.zig b/zig/src/families/inkling2/engine_timing.zig
+new file mode 100644
+index 000000000..00c7154a2
+--- /dev/null
++++ b/zig/src/families/inkling2/engine_timing.zig
+@@ -0,0 +1,89 @@
++//! tf-inkling2-engine timing: graphed window costs by rows and streams, the draft pass, and a short keep, in ms.
++const std = @import("std");
++const ink = @import("inkling2");
++
++const Engine = ink.engine.Engine;
++
++/// Replays timed a cell after the warm ones (medians; a mean of a few swung 10 % between starts on MiMo).
++const reps = 16;
++const warm = 3;
++
++/// Every cell on `k` slots holding the texts' prompts; rank 0 prints a line a cell and the lone table for lanes.zig.
++pub fn run(e: *Engine, a: std.mem.Allocator, io: std.Io, texts: anytype, r0: bool) !u8 {
++    if (texts.len == 0) return error.NoTexts;
++    var lone: [ink.engine.window_rows]f64 = undefined;
++    for (1..ink.engine.window_rows + 1) |rows| {
++        lone[rows - 1] = try cell(e, a, io, texts, 1, rows, .verify);
++        if (r0) std.debug.print("window 1 stream x {d} rows: {d:.2} ms\n", .{ rows, lone[rows - 1] });
++    }
++    for ([_]usize{ 2, 4, 8 }) |k| for ([_]usize{ 1, 2, 4, 8 }) |rows| {
++        const ms = try cell(e, a, io, texts, k, rows, .verify);
++        if (r0) std.debug.print("shared {d} streams x {d} rows ({d} rows): {d:.2} ms\n", .{ k, rows, k * rows, ms });
++    };
++    if (e.drafter != null) for ([_]usize{ 1, 2, 4, 8 }) |k| {
++        const ms = try cell(e, a, io, texts, k, 1, .draft);
++        if (r0) std.debug.print("draft pass, {d} streams: {d:.2} ms\n", .{ k, ms });
++    };
++    for ([_]Cell{ .rewind, .rerun }) |what| {
++        const ms = try cell(e, a, io, texts, 1, ink.engine.window_rows, what);
++        if (r0) std.debug.print("keep 1 of {d} rows by {s}: {d:.2} ms\n", .{ ink.engine.window_rows, @tagName(what), ms });
++    }
++    if (r0) {
++        std.debug.print("lone window ms by rows (lanes window_costs): {{", .{});
++        for (lone, 0..) |ms, i| std.debug.print("{s}{d:.1}", .{ if (i > 0) ", " else " ", ms });
++        std.debug.print(" }}\n", .{});
++    }
++    return 0;
++}
++
++const Cell = enum { verify, draft, rewind, rerun };
++
++/// Median ms of `reps` timed calls: a verify of k windows of `rows`, a draft pass for k streams, or a keep of 1 row.
++fn cell(e: *Engine, a: std.mem.Allocator, io: std.Io, texts: anytype, k: usize, rows: usize, what: Cell) !f64 {
++    var pend: [8]u32 = undefined;
++    var src: [8][]const u32 = undefined;
++    for (0..k) |i| {
++        src[i] = texts[i % texts.len].ids;
++        try e.bind(@intCast(i));
++        e.begin(null);
++        var p: usize = 0;
++        pend[i] = while (true) : (p += ink.engine.prompt_rows) {
++            if (try e.prefillChunk(src[i], p)) |t| break t;
++        };
++    }
++    const ms = try a.alloc(f64, reps);
++    var step: usize = 0;
++    while (step < warm + reps) : (step += 1) {
++        var ids: [8][8]u32 = undefined;
++        var outs: [8][8]u32 = undefined;
++        var parts: [8]ink.engine.Part = undefined;
++        for (0..k) |i| {
++            ids[i][0] = pend[i];
++            for (1..rows) |r| ids[i][r] = src[i][(step * rows + r) % src[i].len]; // real tokens: rows route like text
++            parts[i] = .{ .slot = @intCast(i), .ids = ids[i][0..rows], .out = outs[i][0..rows] };
++        }
++        const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++        switch (what) {
++            .verify, .rewind, .rerun => try e.verifyShared(parts[0..k]),
++            .draft => {
++                var reqs: [8]ink.engine.Req = undefined;
++                var drafts: [8][7]u32 = undefined;
++                for (0..k) |i| reqs[i] = .{ .slot = @intCast(i), .n = 0, .anchor = pend[i], .out = &drafts[i] };
++                try e.draftBlock(reqs[0..k]);
++            },
++        }
++        const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
++        for (0..k) |i| {
++            try e.bind(@intCast(i));
++            if (what == .rerun) e.calls += 1; // the hist rows look stale: keep runs its forward
++            if (what != .draft) try e.keep(if (what == .verify) rows else 1);
++        }
++        try e.stream.synchronize();
++        const t2 = std.Io.Clock.awake.now(io).toNanoseconds();
++        const ns = if (what == .rewind or what == .rerun) t2 - t1 else t1 - t0;
++        if (step >= warm) ms[step - warm] = @as(f64, @floatFromInt(ns)) / 1e6;
++        for (0..k) |i| pend[i] = if (what == .draft) pend[i] else outs[i][if (what == .verify) rows - 1 else 0];
++    }
++    std.mem.sort(f64, ms, {}, std.sort.asc(f64));
++    return ms[reps / 2];
++}
+diff --git a/zig/src/families/inkling2/follow.zig b/zig/src/families/inkling2/follow.zig
+index 867b7a259..8d9c4dead 100644
+--- a/zig/src/families/inkling2/follow.zig
++++ b/zig/src/families/inkling2/follow.zig
+@@ -8,6 +8,7 @@ const Engine = engine.Engine;
+ const image = @import("image.zig");
+ const vision = @import("vision.zig");
+ const pictures = @import("pictures.zig");
++const prof = @import("profile.zig");
+ 
+ pub const Kind = enum(u32) { begin = 1, chunk, shared, keep, release, idle, end, save, drop, reserve, block, images };
+ 
+@@ -114,7 +115,9 @@ pub const Leader = struct {
+             cuda.tp_watch.wake();
+             l.asleep = false;
+         }
++        const t0 = if (prof.global.on) prof.global.now() else 0;
+         try l.send(&x.e.m.ops, hh, ids);
++        prof.global.add(.send, t0);
+     }
+ 
+     /// States rank 0 dropped since the last step, so the other ranks free theirs too.
+@@ -249,7 +252,11 @@ pub const Leader = struct {
+ pub fn follow(e: *Engine, link: *Link) !void {
+     cuda.tp_watch.sleep(e.io);
+     while (true) {
++        const t0 = if (prof.global.on) prof.global.now() else 0;
+         const step = try link.receive();
++        prof.global.add(.wait, t0);
++        const t1 = if (prof.global.on) prof.global.now() else 0;
++        defer prof.global.add(.run, t1);
+         const h = step.h;
+         const kind: Kind = @fromBackingInt(@intCast(h.kind));
+         if (kind == .begin or kind == .chunk or kind == .keep or kind == .save or kind == .images) try e.bind(h.slot);
+@@ -280,6 +287,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
+                     row += n;
+                 }
+                 try e.verifyShared(parts[0..k]);
++                if (prof.global.on) prof.global.round(k, row);
+             },
+             .keep => try e.keep(@intCast(h.a)),
+             .images => {
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index a82f7feef..9e3685e8b 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -75,13 +75,14 @@ pub const Shape = struct {
+     kv: usize, // the rank's key heads
+     ring_rows: usize = 0, // rows a call may write into a sliding ring (0: rows)
+     hist: bool = false, // the calls keep each row's conv inputs (Buffers.hist), so a short keep needs no forward
++    kv8: bool = false, // global layers' caches in fp8 (TF_INKLING2_KV=fp8, kvSetting)
+ 
+     pub fn sliding(s: Shape, c: *const cfg.Config) kernels.Layer {
+         return kernels.Layer.sliding(c.window, @intCast(if (s.ring_rows > 0) s.ring_rows else s.rows));
+     }
+ 
+     pub fn global(s: Shape) kernels.Layer {
+-        return kernels.Layer.global(@intCast(s.context));
++        return kernels.Layer.global(@intCast(s.context), s.kv8);
+     }
+ 
+     fn layer(s: Shape, c: *const cfg.Config, i: usize) kernels.Layer {
+@@ -95,6 +96,15 @@ pub fn stride(c: *const cfg.Config, last_pos: usize) u32 {
+     return @max(kernels.slotsFor(sl, 1), kernels.chunks(last_pos, kernels.global_chunk));
+ }
+ 
++/// Whether the global layers' caches are fp8 (TF_INKLING2_KV=fp8; bf16 by default), read once at engine start.
++pub fn kvSetting() !bool {
++    const env = @import("sys").environment;
++    comptime env.registered("TF_INKLING2_KV");
++    const fp8 = try env.read(u64, "TF_INKLING2_KV", 0) == 1;
++    if (fp8) std.log.info("inkling2: global layers' KV cache in fp8 e4m3 (TF_INKLING2_KV)", .{});
++    return fp8;
++}
++
+ /// Bytes of one cache slot of a stream: K and V rings a layer plus four conv states (the per-stream cost).
+ pub fn slotBytes(c: *const cfg.Config, s: Shape) u64 {
+     var total: u64 = 0;
+@@ -119,6 +129,8 @@ pub const State = struct {
+     bufs: std.ArrayList(Buf) = .empty,
+     kc: []u64 = &.{},
+     vc: []u64 = &.{},
++    ks: []u64 = &.{}, // fp8 global layers: each K row's scale, [slots][ring][kv] fp32 after the rows (else 0)
++    vs: []u64 = &.{},
+     conv: [][4]u64 = &.{}, // k, v (fp32 [slots][3][kv * 128]) and attention, MLP (fp32 [slots][3][hidden]) a layer
+     pos: []usize = &.{}, // positions each slot's caches hold
+     ring: [2]usize = .{ 0, 0 }, // sliding and global ring slots a key head
+@@ -129,14 +141,19 @@ pub const State = struct {
+         errdefer st.deinit();
+         st.kc = try gpa.alloc(u64, c.layers);
+         st.vc = try gpa.alloc(u64, c.layers);
++        st.ks = try gpa.alloc(u64, c.layers);
++        st.vs = try gpa.alloc(u64, c.layers);
+         st.conv = try gpa.alloc([4]u64, c.layers);
+         st.pos = try gpa.alloc(usize, slots);
+         @memset(st.pos, 0);
+         st.ring = .{ s.sliding(c).ring, s.global().ring };
+         for (0..c.layers) |i| {
+             const l = s.layer(c, i);
++            const rows = slots * (l.cacheBytes(s.kv) - l.scaleBytes(s.kv));
+             st.kc[i] = try alloc(d, &st.bufs, gpa, slots * l.cacheBytes(s.kv));
+             st.vc[i] = try alloc(d, &st.bufs, gpa, slots * l.cacheBytes(s.kv));
++            st.ks[i] = if (l.kv8) st.kc[i] + rows else 0;
++            st.vs[i] = if (l.kv8) st.vc[i] + rows else 0;
+             for (0..2) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, slots * 3 * s.kv * c.head_dim * 4);
+             for (2..4) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, slots * 3 * @as(usize, c.hidden) * 4);
+         }
+@@ -144,7 +161,7 @@ pub const State = struct {
+     }
+ 
+     pub fn cache(st: *const State, i: usize) kernels.Cache {
+-        return .{ .k = st.kc[i], .v = st.vc[i] };
++        return .{ .k = st.kc[i], .v = st.vc[i], .ks = st.ks[i], .vs = st.vs[i] };
+     }
+ 
+     /// Back to empty streams: caches and conv states zeroed.
+@@ -168,6 +185,8 @@ pub const State = struct {
+         st.bufs.deinit(st.gpa);
+         st.gpa.free(st.kc);
+         st.gpa.free(st.vc);
++        st.gpa.free(st.ks);
++        st.gpa.free(st.vs);
+         st.gpa.free(st.conv);
+         st.gpa.free(st.pos);
+     }
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index 83fd5932a..fc230c1d1 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -51,4 +51,6 @@ test {
+     _ = dspark;
+     _ = dspark_ops;
+     _ = dspark_run;
++    _ = @import("profile.zig");
++    _ = @import("dspark_quant.zig");
+ }
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 42545e771..6170e6b20 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -16,7 +16,7 @@ pub const global_sub = 1024;
+ pub const subs = global_chunk / global_sub;
+ /// Most rows a call splits its global chunks for (beyond, the tiles fill the GPU without it).
+ pub const split_rows = 64;
+-/// A prompt block's (row, head) pairs (8 warps) and its three K/V tile stages.
++/// A prompt block's (row, head) pairs (8 warps) and its three K/V tile stages (fp8: two raw stages, two bf16 tiles).
+ pub const prompt_pairs = 128;
+ pub const prompt_threads = 256;
+ pub const prompt_shared = 3 * 2 * tile_keys * head_dim * 2;
+@@ -32,23 +32,30 @@ pub const Layer = struct {
+     ring: u32,
+     chunk: u32,
+     tau: bool,
++    kv8: bool = false, // fp8 caches (global layers, TF_INKLING2_KV=fp8): e4m3 [slot][kv_head][128] plus fp32 scales
+ 
+     pub fn sliding(window: u32, rows: u32) Layer {
+         return .{ .window = window, .ring = ringFor(window, rows), .chunk = sliding_chunk, .tau = false };
+     }
+ 
+-    pub fn global(capacity: u32) Layer {
+-        return .{ .window = 0, .ring = @intCast(std.mem.alignForward(usize, capacity, tile_keys)), .chunk = global_chunk, .tau = true };
++    pub fn global(capacity: u32, kv8: bool) Layer {
++        return .{ .window = 0, .ring = @intCast(std.mem.alignForward(usize, capacity, tile_keys)), .chunk = global_chunk, .tau = true, .kv8 = kv8 };
+     }
+ 
+-    /// Bytes of one stream's K (or V) cache on a rank with `kv` key heads (bf16 rows).
++    /// Bytes of one stream's K (or V) cache on a rank with `kv` key heads: bf16 rows, or e4m3 rows and their scales.
+     pub fn cacheBytes(l: Layer, kv: usize) usize {
+-        return @as(usize, l.ring) * kv * head_dim * 2;
++        const per: usize = if (l.kv8) head_dim + 4 else head_dim * 2;
++        return @as(usize, l.ring) * kv * per;
++    }
++
++    /// Bytes of one stream's K (or V) scales (fp8 caches only; every slot's scales follow every slot's rows).
++    pub fn scaleBytes(l: Layer, kv: usize) usize {
++        return if (l.kv8) @as(usize, l.ring) * kv * 4 else 0;
+     }
+ };
+ 
+-/// A layer's caches (addresses): K and V rows.
+-pub const Cache = struct { k: u64, v: u64 };
++/// A layer's caches (addresses): K and V rows, and with fp8 rows each one's scales [slot][kv_head] (fp32).
++pub const Cache = struct { k: u64, v: u64, ks: u64 = 0, vs: u64 = 0 };
+ 
+ /// Sliding ring slots: the window plus a call's rows less one, so a chunk never overwrites keys it still reads.
+ pub fn ringFor(window: u32, rows: u32) u32 {
+@@ -94,8 +101,12 @@ pub const Kernels = struct {
+     attn: cuda.Function,
+     attn_fold: cuda.Function,
+     merge: cuda.Function,
++    prep8: cuda.Function,
++    attn8: cuda.Function,
++    attn_fold8: cuda.Function,
+     pmod: cuda.Module,
+     attn_prompt: cuda.Function,
++    attn_prompt8: cuda.Function,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -105,15 +116,21 @@ pub const Kernels = struct {
+         errdefer pmod.unload();
+         const attn_prompt = try pmod.function("tf_ink2_attn_prompt");
+         try attn_prompt.allowDynamicShared(prompt_shared);
++        const attn_prompt8 = try pmod.function("tf_ink2_attn_prompt8");
++        try attn_prompt8.allowDynamicShared(prompt_shared);
+         return .{
+             .mod = mod,
+             .pmod = pmod,
+             .attn_prompt = attn_prompt,
++            .attn_prompt8 = attn_prompt8,
+             .prep = try mod.function("tf_ink2_prep"),
+             .rel_table = try mod.function("tf_ink2_rel_table"),
+             .attn = try mod.function("tf_ink2_attn"),
+             .attn_fold = try mod.function("tf_ink2_attn_fold"),
+             .merge = try mod.function("tf_ink2_merge"),
++            .prep8 = try mod.function("tf_ink2_prep8"),
++            .attn8 = try mod.function("tf_ink2_attn8"),
++            .attn_fold8 = try mod.function("tf_ink2_attn_fold8"),
+         };
+     }
+ 
+@@ -164,7 +181,8 @@ pub fn prep(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, raw:
+     a.add(int(l.ring));
+     a.add(int(@intFromBool(l.tau)));
+     for ([_]f32{ c.qk_clip, c.rel_clip, c.floor, c.alpha, c.eps }) |v| a.add(v);
+-    try go(k.prep, s, .{ .x = r.rows, .y = r.heads + 2 * r.kv_heads }, 32, &a);
++    if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| a.add(v);
++    try go(if (l.kv8) k.prep8 else k.prep, s, .{ .x = r.rows, .y = r.heads + 2 * r.kv_heads }, 32, &a);
+ }
+ 
+ /// The bias table of each (row, head): its rel vector against the layer's rel_logits_proj [16][1024].
+@@ -177,6 +195,7 @@ pub fn relTable(k: *const Kernels, s: cuda.Stream, r: Rows, rel: u64, proj: u64,
+ /// Attention into chunk partials (`stride` a row and head; a split call's sub-chunks), then the ordered merge.
+ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32, slots: usize, q: u64, kv: Cache, tab: u64, part_o: u64, part_ml: u64, sink: u64, gate: u64, out: u64) !void {
+     if (slotsFor(l, r.last_pos + 1) > stride) return error.Inkling2Partials;
++    if (l.kv8 and l.window > 0) return error.Inkling2Kv8Sliding;
+     const scale: f32 = 1.0 / @sqrt(@as(f32, head_dim));
+     var a: cuda.Args = .{};
+     for ([_]u64{ q, kv.k, kv.v, tab, r.segs, r.tiles, part_o, part_ml }) |v| a.add(v);
+@@ -194,18 +213,22 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, 0, l.chunk, 0, slots_rh }) |v| a.add(int(v));
+         a.add(scale);
+         a.add(int(1));
+-        try go(k.attn, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = slots_rh }, 128, &a);
++        if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| a.add(v);
++        try go(if (l.kv8) k.attn8 else k.attn, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = slots_rh }, 128, &a);
+     } else if (r.streams == 1) { // one stream's rows: 128 pairs a block share each K/V tile, the fold's bits
+         var p: cuda.Args = .{};
+         for ([_]u64{ q, kv.k, kv.v, tab, r.segs, part_o, part_ml }) |v| p.add(v);
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, l.chunk, 0, stride }) |v| p.add(int(v));
+         p.add(scale);
++        if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| p.add(v);
+         const blocks = std.math.divCeil(u32, r.rows * (r.heads / r.kv_heads), prompt_pairs) catch unreachable;
+-        try goShared(k.attn_prompt, s, .{ .x = blocks, .y = r.kv_heads, .z = stride }, prompt_threads, prompt_shared, &p);
++        const f = if (l.kv8) k.attn_prompt8 else k.attn_prompt;
++        try goShared(f, s, .{ .x = blocks, .y = r.kv_heads, .z = stride }, prompt_threads, prompt_shared, &p);
+     } else { // a block a chunk, its sub-chunks folded in order
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, l.chunk, 0, stride }) |v| a.add(int(v));
+         a.add(scale);
+-        try go(k.attn_fold, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = stride }, 128, &a);
++        if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| a.add(v);
++        try go(if (l.kv8) k.attn_fold8 else k.attn_fold, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = stride }, 128, &a);
+     }
+     var b: cuda.Args = .{};
+     for ([_]u64{ part_o, part_ml, sink, gate, r.pos, out }) |v| b.add(v);
+diff --git a/zig/src/families/inkling2/kernels_test.zig b/zig/src/families/inkling2/kernels_test.zig
+index 210ac545e..e235f54cb 100644
+--- a/zig/src/families/inkling2/kernels_test.zig
++++ b/zig/src/families/inkling2/kernels_test.zig
+@@ -28,8 +28,8 @@ test "inkling2 kernels: chunks and scratch at the context targets (1M x 1 and 8
+     const s = k.Layer.sliding(1024, 2048);
+     try t.expectEqual(@as(u32, 3072), s.ring);
+     try t.expect(s.ring % k.tile_keys == 0 and s.ring >= 1024 + 2048 - 1);
+-    try t.expectEqual(@as(u32, 1048576), k.Layer.global(1048576).ring);
+-    try t.expectEqual(@as(u32, 131136), k.Layer.global(131073).ring);
++    try t.expectEqual(@as(u32, 1048576), k.Layer.global(1048576, false).ring);
++    try t.expectEqual(@as(u32, 131136), k.Layer.global(131073, false).ring);
+ }
+ 
+ test "inkling2 kernels: the loader type-checks in a build with kernels" {
+@@ -60,10 +60,10 @@ test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks fo
+             return .{ .d = drv, .handle = @ptrFromInt(i) };
+         }
+     };
+-    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3) };
++    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .prep8 = fun.of(&d, 5), .attn8 = fun.of(&d, 6), .attn_fold8 = fun.of(&d, 7), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3), .attn_prompt8 = fun.of(&d, 8) };
+     const s: cuda.Stream = .{ .d = &d, .handle = null };
+     const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575 };
+-    const l = k.Layer.global(1048576);
++    const l = k.Layer.global(1048576, false);
+     try k.prep(&kern, s, r, l, .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 128000, .alpha = 0.1, .eps = 1e-6 }, .{ 0, 0, 0, 0 }, .{ 0, 0 }, 0, 0, .{ .k = 0, .v = 0 });
+     try k.relTable(&kern, s, r, 0, 0, 0);
+     const all = 24 * 64 * k.subs;
+@@ -92,10 +92,32 @@ test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks fo
+     try k.attend(&kern, s, prompt, l, 64, 2048 * 24 * 64, 0, .{ .k = 0, .v = 0 }, 0, 0, 0, 0, 0, 0);
+     try t.expectEqual([3]u32{ 96, 4, 64 }, Fake.grids[2]);
+     try t.expect(!k.split(.{ .rows = 65, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 7, .last_pos = 100 }, 1, 1 << 30));
++    // fp8 caches: the same grids on the fp8 kernels, and a sliding layer never takes them
++    const l8 = k.Layer.global(1048576, true);
++    const kv8: k.Cache = .{ .k = 0, .v = 0, .ks = 64, .vs = 64 };
++    try k.prep(&kern, s, r, l8, .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 128000, .alpha = 0.1, .eps = 1e-6 }, .{ 0, 0, 0, 0 }, .{ 0, 0 }, 0, 0, kv8);
++    try k.attend(&kern, s, r, l8, 64, all, 0, kv8, 0, 0, 0, 0, 0, 0);
++    try k.attend(&kern, s, two, l8, 64, all - 1, 0, kv8, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual([3]u32{ 1, 32, 1 }, Fake.grids[4]);
++    try t.expectEqual([3]u32{ 1, 4, 64 * k.subs }, Fake.grids[5]);
++    try t.expectEqual([3]u32{ 1, 4, 64 }, Fake.grids[6]);
++    // one stream's fp8 prompt rows: the fp8 prompt kernel, the bf16 one's grid and shared bytes
++    try k.attend(&kern, s, prompt, l8, 64, 2048 * 24 * 64, 0, kv8, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual([3]u32{ 96, 4, 64 }, Fake.grids[7]);
++    try t.expectEqual(@as(u32, k.prompt_threads), Fake.blocks[7]);
++    try t.expectEqual(@as(u32, 98304), Fake.shared[7]);
++    var sl8 = k.Layer.sliding(1024, 1);
++    sl8.kv8 = true;
++    try t.expectError(error.Inkling2Kv8Sliding, k.attend(&kern, s, r, sl8, 64, all, 0, kv8, 0, 0, 0, 0, 0, 0));
+ }
+ 
+-test "inkling2 kernels: a stream's caches are 256 bytes a key head and token" {
+-    try t.expectEqual(@as(usize, 1048576 * 4 * 256), k.Layer.global(1048576).cacheBytes(4));
++test "inkling2 kernels: an fp8 stream at 1M holds 132 of the 256 bytes a key head and token of a bf16 one" {
++    const b = k.Layer.global(1048576, false);
++    const f = k.Layer.global(1048576, true);
++    try t.expectEqual(@as(usize, 1048576 * 4 * 256), b.cacheBytes(4));
++    try t.expectEqual(@as(usize, 1048576 * 4 * 132), f.cacheBytes(4));
++    try t.expectEqual(@as(usize, 1048576 * 4 * 4), f.scaleBytes(4));
++    try t.expectEqual(@as(usize, 0), b.scaleBytes(4));
+     try t.expectEqual(k.Layer.sliding(1024, 2048).cacheBytes(4), 3072 * 4 * 256);
+ }
+ 
+@@ -103,8 +125,8 @@ test "inkling2 kernels: sliding partials are a row's window at any depth, a tile
+     const sl = k.Layer.sliding(1024, 1);
+     try t.expectEqual(@as(u32, 5), k.slotsFor(sl, 1048576)); // keys pos-1023..pos touch at most 5 chunks of 256
+     try t.expectEqual(@as(u32, 6), k.tileChunks(6, sl)); // a tile's 12 rows and their windows: 6 chunks
+-    try t.expectEqual(@as(u32, 64), k.slotsFor(k.Layer.global(1048576), 1048576));
+-    try t.expectEqual(@as(u32, 8), k.slotsFor(k.Layer.global(131072), 131072));
++    try t.expectEqual(@as(u32, 64), k.slotsFor(k.Layer.global(1048576, false), 1048576));
++    try t.expectEqual(@as(u32, 8), k.slotsFor(k.Layer.global(131072, false), 131072));
+ }
+ 
+ /// A call's sliding stores as tf_ink2_attn makes them: each slot the merge reads once; returns the old strays.
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 7a1c8bcbd..270466711 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -5,6 +5,7 @@ const engine = @import("engine.zig");
+ const follow = @import("follow.zig");
+ const image = @import("image.zig");
+ const pictures = @import("pictures.zig");
++const prof = @import("profile.zig");
+ 
+ const be = lanes.backend;
+ 
+@@ -255,6 +256,8 @@ pub const Lanes = struct {
+     /// A round's windows in one forward (Engine.verifyShared), one window or several.
+     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
+         const self = of(ptr);
++        const t0 = if (prof.global.on) prof.global.enter() else 0;
++        defer if (prof.global.on) prof.global.leave(.verify, t0);
+         if (windows.len > engine.max_shared) return error.WindowTooWide;
+         var parts: [engine.max_shared]engine.Part = undefined;
+         var ids: [engine.max_shared][max_rows]u32 = undefined;
+@@ -277,6 +280,11 @@ pub const Lanes = struct {
+         }
+         try self.x.verifyShared(parts[0..windows.len]);
+         if (windows.len > 1) self.shared += 1;
++        if (prof.global.on) {
++            var rows: usize = 0;
++            for (parts[0..windows.len]) |p| rows += p.ids.len;
++            prof.global.round(windows.len, rows);
++        }
+         for (out[0..windows.len], parts[0..windows.len], lane[0..windows.len]) |*o, p, l| {
+             const rows = p.ids.len;
+             @memcpy(o.sampled[0..rows], p.out);
+@@ -287,6 +295,8 @@ pub const Lanes = struct {
+ 
+     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
+         const self = of(ptr);
++        const t0 = if (prof.global.on) prof.global.enter() else 0;
++        defer if (prof.global.on) prof.global.leave(.keep, t0);
+         for (windows, paths) |w, path| {
+             if (path.len == 0) return error.EmptyPath;
+             for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
+@@ -297,6 +307,8 @@ pub const Lanes = struct {
+     /// DSpark: every request's kept rows committed, then one block round for them all (the ranks' block step).
+     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+         const self = of(ptr);
++        const t0 = if (prof.global.on) prof.global.enter() else 0;
++        defer if (prof.global.on) prof.global.leave(.draft, t0);
+         if (self.x.e.drafter == null) return error.NoDraftHead;
+         if (requests.len > engine.max_shared) return error.TooManyStreams;
+         var reqs: [engine.max_shared]engine.Req = undefined;
+diff --git a/zig/src/families/inkling2/profile.zig b/zig/src/families/inkling2/profile.zig
+new file mode 100644
+index 000000000..e8b6970d1
+--- /dev/null
++++ b/zig/src/families/inkling2/profile.zig
+@@ -0,0 +1,87 @@
++//! TF_INKLING2_PROFILE=1: wall ms of a round's phases on each rank, a line every 200 rounds (off: no syncs, no cost).
++const std = @import("std");
++
++pub const Phase = enum { verify, forward, draws, keep, draft, send, outside, wait, run };
++const n_phases = 9;
++
++pub const Profile = struct {
++    on: bool = false,
++    io: ?std.Io = null,
++    ns: [n_phases]u64 = @splat(0),
++    calls: [n_phases]u64 = @splat(0),
++    rounds: u64 = 0,
++    rows: u64 = 0,
++    streams: u64 = 0,
++    last_end: ?u64 = null, // rank 0: when the last lanes call returned
++    rank: usize = 0,
++
++    pub fn now(p: *const Profile) u64 {
++        return @intCast(std.Io.Clock.awake.now(p.io.?).toNanoseconds());
++    }
++
++    pub fn add(p: *Profile, ph: Phase, t0: u64) void {
++        if (!p.on) return;
++        p.ns[@backingInt(ph)] += p.now() - t0;
++        p.calls[@backingInt(ph)] += 1;
++    }
++
++    /// A lanes call starts: the time since the last one returned is outside every call.
++    pub fn enter(p: *Profile) u64 {
++        const t = p.now();
++        if (p.last_end) |e| {
++            p.ns[@backingInt(Phase.outside)] += t - e;
++            p.calls[@backingInt(Phase.outside)] += 1;
++        }
++        return t;
++    }
++
++    pub fn leave(p: *Profile, ph: Phase, t0: u64) void {
++        const t = p.now();
++        p.ns[@backingInt(ph)] += t - t0;
++        p.calls[@backingInt(ph)] += 1;
++        p.last_end = t;
++    }
++
++    /// A verify of `streams` windows and `rows` rows ended a round; every 200 rounds one line, then from zero.
++    pub fn round(p: *Profile, streams: usize, rows: usize) void {
++        p.rounds += 1;
++        p.streams += streams;
++        p.rows += rows;
++        if (p.rounds < 200) return;
++        p.print();
++    }
++
++    pub fn print(p: *Profile) void {
++        var buf: [768]u8 = undefined;
++        var w: std.Io.Writer = .fixed(&buf);
++        const n: f64 = @floatFromInt(@max(p.rounds, 1));
++        w.print("inkling2 profile rank {d}: {d} rounds, {d:.2} streams, {d:.2} rows a round; ms a round:", .{ p.rank, p.rounds, @as(f64, @floatFromInt(p.streams)) / n, @as(f64, @floatFromInt(p.rows)) / n }) catch {};
++        for (p.ns, p.calls, 0..) |ns, c, i| {
++            if (c == 0) continue;
++            w.print(" {s} {d:.2} ({d:.1}/round)", .{ @tagName(@as(Phase, @fromBackingInt(@intCast(i)))), @as(f64, @floatFromInt(ns)) / 1e6 / n, @as(f64, @floatFromInt(c)) / n }) catch {};
++        }
++        std.log.info("{s}", .{w.buffered()});
++        const keep_on = p.on;
++        const keep_io = p.io;
++        const keep_rank = p.rank;
++        p.* = .{ .on = keep_on, .io = keep_io, .rank = keep_rank };
++    }
++};
++
++/// The process's profile (the lanes host, the engine and the follower share it).
++pub var global: Profile = .{};
++
++/// Turns the profile on from TF_INKLING2_PROFILE (read once, at engine start).
++pub fn start(io: std.Io, rank: usize) !void {
++    global.io = io;
++    global.rank = rank;
++    comptime @import("sys").environment.registered("TF_INKLING2_PROFILE");
++    global.on = try @import("sys").environment.read(bool, "TF_INKLING2_PROFILE", false);
++    if (global.on) std.log.info("inkling2 profile: on (rank {d}); forwards synced to time draws apart", .{rank});
++}
++
++test "profile: off adds nothing; a round line resets the counters" {
++    var p: Profile = .{};
++    p.add(.forward, 0);
++    try std.testing.expectEqual(@as(u64, 0), p.calls[@backingInt(Phase.forward)]);
++}
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 132098aa2..6a72b1d05 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -279,6 +279,9 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_GLM_KV_HOST_GIB", .scope = .glm, .kind = .real, .forms = "a finite GiB amount of at least 0 (unset or blank uses one full window and 16 rows a page)" },
+     .{ .name = "TF_INKLING2_RANK", .scope = .inkling2, .kind = .u32, .forms = "a whole rank index, 0 or 1 at two ranks (unset with TF_INKLING2_WORLD gives one rank)" },
+     .{ .name = "TF_INKLING2_WORLD", .scope = .inkling2, .kind = .u32, .min = 1, .forms = "a whole rank count, 2 on CUDA (unset with TF_INKLING2_RANK gives one rank)" },
++    .{ .name = "TF_INKLING2_KV", .scope = .inkling2, .kind = .word, .trim = " ", .words = &.{ "bf16", "fp8" }, .forms = "bf16 or fp8 (unset or blank is bf16)" },
++    .{ .name = "TF_INKLING2_DRAFT_WEIGHTS", .scope = .inkling2, .kind = .word, .trim = " ", .words = &.{ "bf16", "nvfp4" }, .forms = "bf16 or nvfp4 (unset or blank is bf16)" },
++    .{ .name = "TF_INKLING2_PROFILE", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (unset or blank is off)" },
+ };
+ 
+ /// An alias the server refuses at `version` (semantic versions; a pre-release is before its release), else null.
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 5aaf3bd84..b7bf0e608 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -209,6 +209,9 @@ const valid = [_]Case{
+     .{ .name = "TENSORFOLD_PARALLEL", .raw = "AUTO", .n = 0 },
+     .{ .name = "TF_INKLING2_RANK", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_WORLD", .raw = "2", .n = 2 },
++    .{ .name = "TF_INKLING2_KV", .raw = "fp8", .n = 1 },
++    .{ .name = "TF_INKLING2_DRAFT_WEIGHTS", .raw = "nvfp4", .n = 1 },
++    .{ .name = "TF_INKLING2_PROFILE", .raw = "1", .n = 1 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
+-- 
+2.53.0
+

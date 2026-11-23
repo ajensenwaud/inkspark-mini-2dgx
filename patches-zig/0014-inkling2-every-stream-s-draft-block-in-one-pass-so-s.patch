@@ -1,0 +1,327 @@
+From f8bfec2c19c70658d11005e7e35c507bdc09ba26 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:18:20 +1100
+Subject: [PATCH 14/24] inkling2: every stream's draft block in one pass, so
+ shared rounds can draft (TF_INKLING2_PLAIN_STREAMS)
+
+---
+ docs/environment.md                      |   1 +
+ zig/src/families/inkling2/dspark_run.zig | 123 ++++++++++++++---------
+ zig/src/families/inkling2/engine.zig     |   8 +-
+ zig/src/families/inkling2/lanes.zig      |  10 +-
+ zig/src/families/inkling2/native.zig     |   2 +-
+ zig/src/platform/environment.zig         |   1 +
+ zig/src/platform/environment_test.zig    |   1 +
+ 7 files changed, 96 insertions(+), 50 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 32754cea4..22605751b 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -81,6 +81,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TF_INKLING2_KV` | Inkling 2 on CUDA: `fp8` stores the global layers' keys and values as e4m3 with an fp32 scale a token and key head (about half the bytes of a stream); `bf16` (default) keeps them in bf16. Sliding layers stay bf16 |
+ | `TF_INKLING2_DRAFT_WEIGHTS` | Inkling 2 on CUDA: `nvfp4` quantises the bundled drafter's projections to NVFP4 at load (round to nearest); `bf16` (default) keeps them as released. Changes acceptance, never output |
+ | `TF_INKLING2_PROFILE` | Inkling 2 on CUDA: `1` times a round's phases on each rank and logs a line every 200 rounds (syncs the forward; off by default) |
++| `TF_INKLING2_PLAIN_STREAMS` | Inkling 2 on CUDA: shared decode rounds of this many streams or more draft nothing; `0` lets every width draft. Unset: 2 (from two streams on, rounds run plain). Changes speed, never output |
+ | `TF_PROMPT_ROWS` | Native serving: a multiple of 16 from 128 through 2048; unset keeps the chip/family default |
+ | `TF_ANE_COLUMNS` | Whole u32 count; zero disables the experimental share; default zero |
+ | `TF_METAL4` | Metal: exactly `0` or `1`; `1` sends a family's GPU work through Metal 4 (macOS 26 and later) where the family supports it: the same kernels in the same order, with Metal 4's command queue, allocators, argument tables and barriers, and bit-identical outputs; `0` keeps Metal 3. DeepSeek-V4.1 defaults to `1` where the Mac has Metal 4 (its device test rigs to `0`); Macs without it stay on Metal 3 |
+diff --git a/zig/src/families/inkling2/dspark_run.zig b/zig/src/families/inkling2/dspark_run.zig
+index af6ceb22c..9cf027049 100644
+--- a/zig/src/families/inkling2/dspark_run.zig
++++ b/zig/src/families/inkling2/dspark_run.zig
+@@ -55,6 +55,12 @@ pub fn initSlot(d: *const cuda.Driver, c: *const ds.Config, kv: usize, capacity:
+ /// A sampled stream's keys (sample.cu's seed and 1 / T): its drafts race as its target draws will, not greedily.
+ pub const Race = struct { seed: u64, inv_t: f32 };
+ 
++/// One stream's block in a pass: its slot, the anchor at position `p`, its sampling and its drafts.
++pub const Block = struct { slot: *Slot, anchor: u32, p: usize, race: ?Race, out: []u32 };
++
++/// The most streams one pass takes (engine.max_shared).
++pub const max_streams = 16;
++
+ pub const Drafter = struct {
+     gpa: std.mem.Allocator,
+     d: *const cuda.Driver,
+@@ -74,6 +80,8 @@ pub const Drafter = struct {
+     cap: f32,
+     capacity: usize,
+     ctx_rows: usize, // rows an absorb takes at most
++    streams: usize = max_streams, // blocks a pass takes at most
++    masks: u64 = 0, // bf16 [T - 1][hidden]: the mask embedding rows past a block's anchor
+     part: u64 = 0,
+     fold: u64 = 0, // bf16 [nv][rank]: the head times hidden_out
+     fbias: u64 = 0, // bf16 [nv]: the head times hidden_out's bias
+@@ -84,16 +92,16 @@ pub const Drafter = struct {
+     att: u64 = 0,
+     gu: u64 = 0,
+     act: u64 = 0,
+-    gath: u64 = 0, // fp32 [world][T][hidden]
++    gath: u64 = 0, // fp32 [world][streams * T][hidden]
+     po: u64 = 0,
+     pml: u64 = 0,
+-    base: u64 = 0, // bf16 [T - 1][nv]
++    base: u64 = 0, // bf16 [streams * T][nv]
+     mctx: u64 = 0, // fp32 [T - 1][3 rank]
+     state: u64 = 0,
+     latent: u64 = 0,
+     scores: u64 = 0, // fp32 [nv]
+     picks: u64 = 0, // every rank's (value, id), padded to 16 bytes so the RoCE gather takes it
+-    walk: u64 = 0, // int32 [T]: the anchor, then each step's pick
++    walk: u64 = 0, // int32 [streams][T]: each block's anchor, then each step's pick
+     ids: u64 = 0,
+     mixed: u64 = 0, // bf16 [ctx_rows][hidden]
+     ckv: u64 = 0, // bf16 [ctx_rows][2 kv * 128]
+@@ -112,13 +120,14 @@ pub const Drafter = struct {
+         errdefer for (dr.bufs.items) |*b| b.free();
+         const h = dr.hidden;
+         var part: usize = 0;
++        const TS = max_streams * T; // a pass's rows at most
+         for (w.layers[0..w.c.layers]) |l| for ([_]cuda.qmmf.Weight{ l.qkv, l.o, l.gu, l.down }) |x| {
+-            part = @max(part, dr.lane.partBytes(T, x));
++            part = @max(part, dr.lane.partBytes(TS, x));
+         };
+         for (w.layers[0..w.c.layers]) |l| part = @max(part, dr.lane.partBytes(ctx_rows, l.kv));
+         const R: usize = w.c.rank;
+         const qkvw = (dr.hq + 2 * dr.hk) * 128;
+-        const sizes = [_]usize{ part, dr.nv * R * 2, dr.nv * 2, T * h * 2, T * h * 2, T * qkvw * 2, T * dr.hq * 128 * 2, T * dr.hq * 128 * 2, T * 2 * dr.inter * 2, T * dr.inter * 2, dr.world * T * h * 4, dk.chunks(0, capacity) * T * dr.hq * 128 * 4, dk.chunks(0, capacity) * T * dr.hq * 8, T * dr.nv * 2, T * 3 * R * 4, R * 2, R * 2, dr.nv * 4, dr.world * 16, T * 4, T * 4, ctx_rows * h * 2, ctx_rows * 2 * dr.hk * 128 * 2 };
++        const sizes = [_]usize{ part, dr.nv * R * 2, dr.nv * 2, TS * h * 2, TS * h * 2, TS * qkvw * 2, TS * dr.hq * 128 * 2, TS * dr.hq * 128 * 2, TS * 2 * dr.inter * 2, TS * dr.inter * 2, dr.world * TS * h * 4, dk.chunks(0, capacity) * T * dr.hq * 128 * 4, dk.chunks(0, capacity) * T * dr.hq * 8, TS * dr.nv * 2, T * 3 * R * 4, R * 2, R * 2, dr.nv * 4, dr.world * 16, TS * 4, TS * 4, ctx_rows * h * 2, ctx_rows * 2 * dr.hk * 128 * 2, (T - 1) * h * 2 };
+         var ptrs: [sizes.len]u64 = undefined;
+         for (sizes, &ptrs) |n, *p| {
+             var b = try Buf.alloc(d, @max(n, 256));
+@@ -127,7 +136,8 @@ pub const Drafter = struct {
+             try dr.bufs.append(gpa, b);
+             p.* = b.ptr;
+         }
+-        inline for (.{ "part", "fold", "fbias", "resid", "x", "qkv", "q", "att", "gu", "act", "gath", "po", "pml", "base", "mctx", "state", "latent", "scores", "picks", "walk", "ids", "mixed", "ckv" }, 0..) |name, i| @field(dr, name) = ptrs[i];
++        inline for (.{ "part", "fold", "fbias", "resid", "x", "qkv", "q", "att", "gu", "act", "gath", "po", "pml", "base", "mctx", "state", "latent", "scores", "picks", "walk", "ids", "mixed", "ckv", "masks" }, 0..) |name, i| @field(dr, name) = ptrs[i];
++        for (0..T - 1) |r| try dr.copy(s, dr.masks + r * h * 2, dr.w.mask, h * 2);
+         try dr.foldHead(m, s, t);
+         return dr;
+     }
+@@ -210,63 +220,82 @@ pub const Drafter = struct {
+ 
+     /// A block at anchor `p` (context absorbed below p): `n` drafts, greedy or raced as the verify draws (`race`).
+     pub fn draft(dr: *Drafter, m: *fw.Modules, s: cuda.Stream, ex: fw.Exchange, t: anytype, slot: *Slot, anchor: u32, p: usize, race: ?Race, out: []u32) !void {
++        try dr.draftMany(m, s, ex, t, &.{.{ .slot = slot, .anchor = anchor, .p = p, .race = race, .out = out }});
++    }
++
++    /// Several streams' blocks in one pass: the layers and the head over every block's rows, then each walk.
++    pub fn draftMany(dr: *Drafter, m: *fw.Modules, s: cuda.Stream, ex: fw.Exchange, t: anytype, bs: []const Block) !void {
+         const c = &dr.w.c;
+         const h = dr.hidden;
+-        const n = out.len;
+-        if (n == 0 or n > T - 1 or p + T > dr.capacity) return error.Inkling2DraftShape;
+-        if (slot.to != p) slot.* = .{ .buf = slot.buf, .off = slot.off, .stash = slot.stash, .frnn = slot.frnn, .from = p, .to = p };
+-        const one = [1]i32{@intCast(anchor)};
+-        try cuda.copy_source.enqueue(dr.d, dr.ids, std.mem.sliceAsBytes(&one), s);
+-        try cuda.copy_source.enqueue(dr.d, dr.walk, std.mem.sliceAsBytes(&one), s);
+-        try ops.embed(&m.ops, s, dr.ids, 1, t.embed, t.embed_norm, dr.resid, h, t.config.eps);
+-        for (1..T) |r| try dr.copy(s, dr.resid + r * h * 2, dr.w.mask, h * 2);
+-        try dk.addNorm(&dr.k, s, dr.resid, 0, 0, 0, dr.w.layers[0].in_norm, dr.x, T, h, c.eps);
++        const S = bs.len;
++        if (S == 0 or S > dr.streams) return error.Inkling2DraftShape;
++        const rows = S * T;
++        var host: [2 * max_streams * T]i32 = undefined;
++        for (bs, 0..) |b, j| {
++            if (b.out.len == 0 or b.out.len > T - 1 or b.p + T > dr.capacity) return error.Inkling2DraftShape;
++            if (b.slot.to != b.p) b.slot.* = .{ .buf = b.slot.buf, .off = b.slot.off, .stash = b.slot.stash, .frnn = b.slot.frnn, .from = b.p, .to = b.p };
++            @memset(host[j * T ..][0..T], @intCast(b.anchor)); // ids: the anchor (rows past it take the mask below)
++            @memset(host[rows + j * T ..][0..T], @intCast(b.anchor)); // the walk starts at the anchor
++        }
++        try cuda.copy_source.enqueue(dr.d, dr.ids, std.mem.sliceAsBytes(host[0..rows]), s);
++        try cuda.copy_source.enqueue(dr.d, dr.walk, std.mem.sliceAsBytes(host[rows .. 2 * rows]), s);
++        try ops.embed(&m.ops, s, dr.ids, rows, t.embed, t.embed_norm, dr.resid, h, t.config.eps);
++        for (0..S) |j| try dr.copy(s, dr.resid + (j * T + 1) * h * 2, dr.masks, (T - 1) * h * 2);
++        try dk.addNorm(&dr.k, s, dr.resid, 0, 0, 0, dr.w.layers[0].in_norm, dr.x, rows, h, c.eps);
+         const L = dr.w.layers[0..c.layers];
+         const scale: f32 = 1.0 / @sqrt(128.0);
++        const qkvw = (dr.hq + 2 * dr.hk) * 128;
+         for (L, 0..) |l, i| {
+-            try dr.mm(s, l.qkv, dr.x, T, dr.qkv, .bf16);
++            try dr.mm(s, l.qkv, dr.x, rows, dr.qkv, .bf16);
+             const r = ring(c, i, dr.capacity);
+-            try dk.qk(&dr.k, s, .{ .x = dr.qkv, .qw = l.q_norm, .kw = l.k_norm, .q = dr.q, .kc = slot.keys(i), .vc = slot.values(i), .ld = @intCast((dr.hq + 2 * dr.hk) * 128), .hq = @intCast(dr.hq), .hk = @intCast(dr.hk), .ring = @intCast(r), .pos0 = @intCast(p), .eps = c.eps, .theta = c.theta }, T);
+-            const lo = if (c.local[i]) @max(slot.from, p -| c.window) else slot.from;
+-            try dk.attend(&dr.k, s, .{ .q = dr.q, .kc = slot.keys(i), .vc = slot.values(i), .po = dr.po, .pml = dr.pml, .T = T, .hq = @intCast(dr.hq), .hk = @intCast(dr.hk), .ring = @intCast(r), .lo = @intCast(lo), .hi = @intCast(p + T - 1), .c0 = 0, .scale = scale }, dr.att);
+-            try dr.mm(s, l.o, dr.att, T, dr.mySlot(T), .f32);
+-            try dr.gather(s, ex, T);
+-            try dk.addNorm(&dr.k, s, dr.resid, dr.gath, dr.world, T * h, l.post_norm, dr.x, T, h, c.eps);
+-            try dr.mm(s, l.gu, dr.x, T, dr.gu, .bf16);
+-            try dk.silu(&dr.k, s, dr.gu, dr.act, T, dr.inter);
+-            try dr.mm(s, l.down, dr.act, T, dr.mySlot(T), .f32);
+-            try dr.gather(s, ex, T);
++            for (bs, 0..) |b, j| {
++                const q = dr.q + j * T * dr.hq * 128 * 2;
++                try dk.qk(&dr.k, s, .{ .x = dr.qkv + j * T * qkvw * 2, .qw = l.q_norm, .kw = l.k_norm, .q = q, .kc = b.slot.keys(i), .vc = b.slot.values(i), .ld = @intCast(qkvw), .hq = @intCast(dr.hq), .hk = @intCast(dr.hk), .ring = @intCast(r), .pos0 = @intCast(b.p), .eps = c.eps, .theta = c.theta }, T);
++                const lo = if (c.local[i]) @max(b.slot.from, b.p -| c.window) else b.slot.from;
++                try dk.attend(&dr.k, s, .{ .q = q, .kc = b.slot.keys(i), .vc = b.slot.values(i), .po = dr.po, .pml = dr.pml, .T = T, .hq = @intCast(dr.hq), .hk = @intCast(dr.hk), .ring = @intCast(r), .lo = @intCast(lo), .hi = @intCast(b.p + T - 1), .c0 = 0, .scale = scale }, dr.att + j * T * dr.hq * 128 * 2);
++            }
++            try dr.mm(s, l.o, dr.att, rows, dr.mySlot(rows), .f32);
++            try dr.gather(s, ex, rows);
++            try dk.addNorm(&dr.k, s, dr.resid, dr.gath, dr.world, rows * h, l.post_norm, dr.x, rows, h, c.eps);
++            try dr.mm(s, l.gu, dr.x, rows, dr.gu, .bf16);
++            try dk.silu(&dr.k, s, dr.gu, dr.act, rows, dr.inter);
++            try dr.mm(s, l.down, dr.act, rows, dr.mySlot(rows), .f32);
++            try dr.gather(s, ex, rows);
+             const next = if (i + 1 < L.len) L[i + 1].in_norm else dr.w.norm;
+-            try dk.addNorm(&dr.k, s, dr.resid, dr.gath, dr.world, T * h, next, dr.x, T, h, c.eps);
++            try dk.addNorm(&dr.k, s, dr.resid, dr.gath, dr.world, rows * h, next, dr.x, rows, h, c.eps);
+         }
+-        // rows 1..7: the head's base logits, the Markov context, then the walk from the anchor
+-        const hid = dr.x + h * 2;
+-        try m.dense.decode(s, t.head, hid, .bf16, T - 1, dr.base, .bf16);
++        // rows 1..7 of each block: the head's base logits (one call: one block alone keeps its 7-row call), the walks
++        if (S == 1) try m.dense.decode(s, t.head, dr.x + h * 2, .bf16, T - 1, dr.base + dr.nv * 2, .bf16) else try m.dense.decode(s, t.head, dr.x, .bf16, rows, dr.base, .bf16);
+         const R: usize = c.rank;
+-        try dk.ctx(&dr.k, s, hid, slot.frnn, dr.w.rnn, dr.w.rnn_bias, dr.mctx, T - 1, h, R);
+-        try dr.d.check(dr.d.api.cuMemsetD8Async(dr.state, 0, R * 2, s.handle), "cuMemsetD8Async");
+-        for (0..n) |j| {
+-            try dk.rnn(&dr.k, s, dr.mctx + j * 3 * R * 4, dr.w.rnn, dr.w.w1, dr.walk, j, dr.state, dr.latent, R, h);
+-            try dk.vocab(&dr.k, s, dr.base + j * dr.nv * 2, dr.latent, dr.fold, dr.fbias, dr.cap, dr.valid, dr.nv, dr.scores);
+-            if (dr.keep_logits != 0) try dr.copy(s, dr.keep_logits + j * dr.nv * 4, dr.scores, dr.nv * 4);
+-            const mine = dr.picks + dr.rank * 16;
+-            if (race) |r| {
+-                try ops.race1(&m.ops, s, dr.scores, dr.valid, dr.vlo, r.seed, r.inv_t, p + 1 + j, mine, mine + 4);
+-            } else try ops.top1(&m.ops, s, dr.scores, 1, dr.nv, dr.nv, dr.vlo, mine, mine + 4);
+-            switch (ex) {
+-                .local => {},
+-                .nccl => |x| if (x.group) |g| try g.allGather(s, mine, dr.picks, 16) else try x.lib.check(x.lib.api.ncclAllGather(mine, dr.picks, 16, .u8, x.comm, s.handle), "ncclAllGather"),
++        for (bs, 0..) |b, j| {
++            const hid = dr.x + (j * T + 1) * h * 2;
++            const walk = dr.walk + j * T * 4;
++            try dk.ctx(&dr.k, s, hid, b.slot.frnn, dr.w.rnn, dr.w.rnn_bias, dr.mctx, T - 1, h, R);
++            try dr.d.check(dr.d.api.cuMemsetD8Async(dr.state, 0, R * 2, s.handle), "cuMemsetD8Async");
++            for (0..b.out.len) |st| {
++                try dk.rnn(&dr.k, s, dr.mctx + st * 3 * R * 4, dr.w.rnn, dr.w.w1, walk, st, dr.state, dr.latent, R, h);
++                try dk.vocab(&dr.k, s, dr.base + (j * T + 1 + st) * dr.nv * 2, dr.latent, dr.fold, dr.fbias, dr.cap, dr.valid, dr.nv, dr.scores);
++                if (dr.keep_logits != 0 and S == 1) try dr.copy(s, dr.keep_logits + st * dr.nv * 4, dr.scores, dr.nv * 4);
++                const mine = dr.picks + dr.rank * 16;
++                if (b.race) |rc| {
++                    try ops.race1(&m.ops, s, dr.scores, dr.valid, dr.vlo, rc.seed, rc.inv_t, b.p + 1 + st, mine, mine + 4);
++                } else try ops.top1(&m.ops, s, dr.scores, 1, dr.nv, dr.nv, dr.vlo, mine, mine + 4);
++                switch (ex) {
++                    .local => {},
++                    .nccl => |x| if (x.group) |g| try g.allGather(s, mine, dr.picks, 16) else try x.lib.check(x.lib.api.ncclAllGather(mine, dr.picks, 16, .u8, x.comm, s.handle), "ncclAllGather"),
++                }
++                try dk.pick(&dr.k, s, dr.picks, dr.world, walk, st);
+             }
+-            try dk.pick(&dr.k, s, dr.picks, dr.world, dr.walk, j);
+         }
+         try s.synchronize();
+         switch (ex) {
+             .local => {},
+             .nccl => |x| if (x.group) |g| try g.check(),
+         }
+-        var got: [T]i32 = undefined;
+-        try (Buf{ .d = dr.d, .ptr = dr.walk, .len = T * 4, .borrowed = true }).download(0, std.mem.sliceAsBytes(got[0 .. n + 1]));
+-        for (out, got[1 .. n + 1]) |*o, g| o.* = @intCast(g);
++        try (Buf{ .d = dr.d, .ptr = dr.walk, .len = rows * 4, .borrowed = true }).download(0, std.mem.sliceAsBytes(host[0..rows]));
++        for (bs, 0..) |b, j| for (b.out, host[j * T + 1 ..][0..b.out.len]) |*o, g| {
++            o.* = @intCast(g);
++        };
+     }
+ 
+     fn copy(dr: *const Drafter, s: cuda.Stream, dst: u64, src: u64, bytes: usize) !void {
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 0c1552286..99a1015dc 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -489,6 +489,9 @@ pub const Engine = struct {
+     /// Each request's kept rows absorbed (positions just below its committed length), then its block's drafts.
+     pub fn draftBlock(e: *Engine, reqs: []const Req) !void {
+         const dr = e.drafter orelse return error.NoDraftHead;
++        if (reqs.len > drun.max_streams) return error.Inkling2DraftShape;
++        var bs: [drun.max_streams]drun.Block = undefined;
++        var nb: usize = 0;
+         for (reqs) |r| {
+             try e.bind(r.slot);
+             const s = &e.dslots[r.slot];
+@@ -496,8 +499,11 @@ pub const Engine = struct {
+             if (r.n > 0) try dr.absorb(e.stream, s, s.stash, r.n, at - r.n);
+             // a sampled stream's drafts race with its own keys: drafts its verify will draw, the output unchanged
+             const race: ?drun.Race = if (e.seqs[r.slot].sampling) |sm| .{ .seed = sampler.rule(sm).seed, .inv_t = sampler.rule(sm).inv_t } else null;
+-            if (r.out.len > 0) try dr.draft(&e.m, e.stream, e.exchange, &e.w, s, r.anchor, at, race, r.out);
++            if (r.out.len == 0) continue;
++            bs[nb] = .{ .slot = s, .anchor = r.anchor, .p = at, .race = race, .out = r.out };
++            nb += 1;
+         }
++        if (nb > 0) try dr.draftMany(&e.m, e.stream, e.exchange, &e.w, bs[0..nb]); // every block in one pass
+     }
+ 
+     pub fn dropState(e: *Engine, id: u64) void {
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 55c6b7467..e45989b59 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -34,6 +34,13 @@ const mini_shared_costs = [_]lanes.config.Cost{
+     .{ .width = 16, .ms = 48.1 }, .{ .width = 32, .ms = 66.2 }, .{ .width = 64, .ms = 88.0 },
+ };
+ 
++/// TF_INKLING2_PLAIN_STREAMS, else 2: shared rounds this wide go plain (drafting them lost 5-10 % at 4-8 streams).
++pub fn plainStreams() !u32 {
++    const env = @import("sys").environment;
++    comptime env.registered("TF_INKLING2_PLAIN_STREAMS");
++    return @intCast(try env.read(u64, "TF_INKLING2_PLAIN_STREAMS", 2));
++}
++
+ /// A stream's place in the backend: its slot, the rows its last window left uncommitted, its first token.
+ const Lane = struct {
+     slot: u32,
+@@ -54,6 +61,7 @@ pub const Lanes = struct {
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+     shared: u64 = 0, // forwards that held several streams' windows
++    plain_streams: u32 = 2, // shared rounds this wide draft none (plainStreams; 0: every width drafts)
+ 
+     pub fn deinit(self: *Lanes) void {
+         self.lanes.deinit(self.x.e.gpa);
+@@ -93,7 +101,7 @@ pub const Lanes = struct {
+             .draft_streams = head,
+             .mtp_step_ms = if (head) @as(f64, if (mini) 7.8 else 16.4) / max_held else 0, // a block's 7 drafts in one pass
+             .draft_step_ms = if (head) (if (mini) 7.5 else 15.9) else 0, // a shared round's block pass, a stream at a time
+-            .plain_streams = if (head) 2 else 0, // passes run a stream at a time: shared rounds draft none
++            .plain_streams = if (head) self.plain_streams else 0,
+             .plain_guard = head, // plain rounds compete: one-row forwards are cheap next to a draft pass
+             .window_costs = if (!head) &.{} else if (mini) &mini_window_costs else &gb10_window_costs,
+             .window_costs_lone = true,
+diff --git a/zig/src/families/inkling2/native.zig b/zig/src/families/inkling2/native.zig
+index c73e61544..de649876e 100644
+--- a/zig/src/families/inkling2/native.zig
++++ b/zig/src/families/inkling2/native.zig
+@@ -175,7 +175,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         std.process.exit(0);
+     }
+     own.link.?.asleep = cuda.tp_watch.open();
+-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link.? } };
++    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link.? }, .plain_streams = try ink_lanes.plainStreams() };
+     if (lim) |l| own.offer = try pictures.Offer.init(gpa, io, l);
+     return .{
+         .backend = own.lanes.backend(),
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 6a72b1d05..7663c8354 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -282,6 +282,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_KV", .scope = .inkling2, .kind = .word, .trim = " ", .words = &.{ "bf16", "fp8" }, .forms = "bf16 or fp8 (unset or blank is bf16)" },
+     .{ .name = "TF_INKLING2_DRAFT_WEIGHTS", .scope = .inkling2, .kind = .word, .trim = " ", .words = &.{ "bf16", "nvfp4" }, .forms = "bf16 or nvfp4 (unset or blank is bf16)" },
+     .{ .name = "TF_INKLING2_PROFILE", .scope = .inkling2, .kind = .flag, .forms = "0 or 1 (unset or blank is off)" },
++    .{ .name = "TF_INKLING2_PLAIN_STREAMS", .scope = .inkling2, .kind = .size, .max = 16, .forms = "a whole stream count from 0 to 16 (0: every width drafts; unset: the family's default)" },
+ };
+ 
+ /// An alias the server refuses at `version` (semantic versions; a pre-release is before its release), else null.
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index b7bf0e608..ee1bf9b07 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -212,6 +212,7 @@ const valid = [_]Case{
+     .{ .name = "TF_INKLING2_KV", .raw = "fp8", .n = 1 },
+     .{ .name = "TF_INKLING2_DRAFT_WEIGHTS", .raw = "nvfp4", .n = 1 },
+     .{ .name = "TF_INKLING2_PROFILE", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_PLAIN_STREAMS", .raw = "2", .n = 2 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
+-- 
+2.53.0
+

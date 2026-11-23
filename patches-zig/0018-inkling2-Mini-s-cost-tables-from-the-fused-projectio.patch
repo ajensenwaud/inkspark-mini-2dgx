@@ -1,0 +1,52 @@
+From bc093ba05bba7913333310e13685eb70be112cb3 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:46:16 +1100
+Subject: [PATCH 18/24] inkling2: Mini's cost tables from the fused projections
+ and the NVFP4 drafter's pass
+
+---
+ zig/src/families/inkling2/lanes.zig | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index e45989b59..19cb03e2d 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -24,15 +24,18 @@ const gb10_shared_costs = [_]lanes.config.Cost{
+     .{ .width = 8, .ms = 81.4 },   .{ .width = 16, .ms = 120.6 }, .{ .width = 32, .ms = 182.3 },
+     .{ .width = 64, .ms = 223.4 },
+ };
+-/// Mini's (pack A, 4.05 bpw) lone windows and shared forwards, timed the same way; its draft pass 7.8 ms a stream.
++/// Mini's (pack A, 4.05 bpw) lone windows and shared forwards, timed the same way with the serve's NVFP4 drafter.
+ const mini_window_costs = [_]lanes.config.Cost{
+-    .{ .width = 1, .ms = 17.9 }, .{ .width = 2, .ms = 21.7 }, .{ .width = 3, .ms = 24.2 }, .{ .width = 4, .ms = 26.7 },
+-    .{ .width = 5, .ms = 28.6 }, .{ .width = 6, .ms = 30.3 }, .{ .width = 7, .ms = 31.8 }, .{ .width = 8, .ms = 33.2 },
++    .{ .width = 1, .ms = 17.1 }, .{ .width = 2, .ms = 20.7 }, .{ .width = 3, .ms = 23.1 }, .{ .width = 4, .ms = 25.5 },
++    .{ .width = 5, .ms = 27.3 }, .{ .width = 6, .ms = 29.0 }, .{ .width = 7, .ms = 31.0 }, .{ .width = 8, .ms = 32.2 },
+ };
+ const mini_shared_costs = [_]lanes.config.Cost{
+-    .{ .width = 1, .ms = 17.9 },  .{ .width = 2, .ms = 21.7 },  .{ .width = 4, .ms = 28.7 },  .{ .width = 8, .ms = 36.8 },
+-    .{ .width = 16, .ms = 48.1 }, .{ .width = 32, .ms = 66.2 }, .{ .width = 64, .ms = 88.0 },
++    .{ .width = 1, .ms = 17.1 },  .{ .width = 2, .ms = 20.5 },  .{ .width = 4, .ms = 27.8 },  .{ .width = 8, .ms = 35.4 },
++    .{ .width = 16, .ms = 47.0 }, .{ .width = 32, .ms = 66.1 }, .{ .width = 64, .ms = 87.5 },
+ };
++/// Mini's draft pass (NVFP4): one stream's block, and each further stream's share of one pass.
++const mini_pass_ms = 7.0;
++const mini_stream_ms = 4.0;
+ 
+ /// TF_INKLING2_PLAIN_STREAMS, else 2: shared rounds this wide go plain (drafting them lost 5-10 % at 4-8 streams).
+ pub fn plainStreams() !u32 {
+@@ -99,8 +102,8 @@ pub const Lanes = struct {
+             .speculate_early = false,
+             .drafts = if (head) max_held else 0,
+             .draft_streams = head,
+-            .mtp_step_ms = if (head) @as(f64, if (mini) 7.8 else 16.4) / max_held else 0, // a block's 7 drafts in one pass
+-            .draft_step_ms = if (head) (if (mini) 7.5 else 15.9) else 0, // a shared round's block pass, a stream at a time
++            .mtp_step_ms = if (head) @as(f64, if (mini) mini_pass_ms else 16.4) / max_held else 0, // 7 drafts a pass
++            .draft_step_ms = if (head) (if (mini) mini_stream_ms else 15.9) else 0, // a further stream's share
+             .plain_streams = if (head) self.plain_streams else 0,
+             .plain_guard = head, // plain rounds compete: one-row forwards are cheap next to a draft pass
+             .window_costs = if (!head) &.{} else if (mini) &mini_window_costs else &gb10_window_costs,
+-- 
+2.53.0
+

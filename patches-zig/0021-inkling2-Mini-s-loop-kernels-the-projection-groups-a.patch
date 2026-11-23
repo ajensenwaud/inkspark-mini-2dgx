@@ -1,0 +1,1250 @@
+From 83e5ea897be4d3ea3db757c16be82e12c461f02b Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:50:31 +1100
+Subject: [PATCH 21/24] inkling2: Mini's loop kernels, the projection groups
+ and the batched draft walk under the kernel contract
+
+Gates 1-4 with float64 references and a planted control each: tf_ink2_loop_msg
+(both outputs), down8/16/64, blend, mix, norm and bank against interval
+references at the served shapes (decode rows to 2,048-row prompt passes);
+tf_exl3_group5_* and tf_exl3_rot_group5 as replacements of each member's
+linear_body and rot_in (contract_exl3's case, with the family's launch);
+tf_ink2_dsp_vocab_rows and tf_ink2_dsp_pick_rows beside their one-row
+kernels' tests. The family exports proj_group for the tests; no served code
+changes.
+---
+ zig/src/families/inkling2/inkling2.zig        |   1 +
+ zig/tests/cuda/contract_exl3.zig              |  22 +-
+ zig/tests/cuda/contract_inkling2.zig          |  10 +-
+ zig/tests/cuda/contract_inkling2_dspark.zig   |   8 +-
+ .../cuda/contract_inkling2_dspark_glue.zig    |  16 +-
+ .../cuda/contract_inkling2_dspark_head.zig    |  12 +-
+ zig/tests/cuda/contract_inkling2_group5.zig   | 115 +++++
+ zig/tests/cuda/contract_inkling2_loop.zig     |  45 ++
+ .../cuda/contract_inkling2_loop_gate.zig      | 454 ++++++++++++++++++
+ zig/tests/cuda/contract_inkling2_loop_ops.zig | 315 ++++++++++++
+ 10 files changed, 978 insertions(+), 20 deletions(-)
+ create mode 100644 zig/tests/cuda/contract_inkling2_group5.zig
+ create mode 100644 zig/tests/cuda/contract_inkling2_loop.zig
+ create mode 100644 zig/tests/cuda/contract_inkling2_loop_gate.zig
+ create mode 100644 zig/tests/cuda/contract_inkling2_loop_ops.zig
+
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index d3ce2fe80..f8f714628 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -26,6 +26,7 @@ pub const native = @import("native.zig");
+ pub const dspark = @import("dspark.zig");
+ pub const dspark_ops = @import("dspark_ops.zig");
+ pub const dspark_run = @import("dspark_run.zig");
++pub const proj_group = @import("proj_group.zig");
+ 
+ /// config.json's name in the release.
+ pub const model_type = "inkling2";
+diff --git a/zig/tests/cuda/contract_exl3.zig b/zig/tests/cuda/contract_exl3.zig
+index 6b6a769b2..bddfef1a8 100644
+--- a/zig/tests/cuda/contract_exl3.zig
++++ b/zig/tests/cuda/contract_exl3.zig
+@@ -134,14 +134,18 @@ fn other(w: exl3.Weight) exl3.Weight {
+     return x;
+ }
+ 
++/// A family's group launch in place of matmulGroup (contract_inkling2_group5.zig): its members by n, fit and launch.
++pub const Ext = struct { members: *const fn (usize) []const usize, fits: *const fn ([]const exl3.Weight, usize) bool, run: *const fn (*Case, []const exl3.Weight, []const u64) anyerror!void };
++
+ pub const Case = struct {
+     rig: rig_.Rig,
+     lin: *exl3.Linear,
+     kind: Kind,
++    ext: ?*const Ext = null,
+     halves: u32 = 8,
+     control: bool = false,
+     shape: c.Shape = undefined,
+-    mats: [3]Mat = .{ .{ .k = 0, .n = 0 }, .{ .k = 0, .n = 0 }, .{ .k = 0, .n = 0 } },
++    mats: [5]Mat = @splat(.{ .k = 0, .n = 0 }),
+     nm: usize = 1,
+     x: []u16 = &.{},
+     xd: u64 = 0,
+@@ -151,7 +155,7 @@ pub const Case = struct {
+     xh_base: u64 = 0,
+     z: u64 = 0,
+     counters: u64 = 0,
+-    wbuf: [3]exl3.Weight = undefined,
++    wbuf: [5]exl3.Weight = undefined,
+     msg: [160]u8 = undefined,
+ 
+     pub fn deinit(self: *Case) void {
+@@ -175,7 +179,7 @@ pub const Case = struct {
+         return .{ .spec = spec(self.kind, self.halves, self.control), .ctx = self, .vt = &vt, .control = if (self.control) .shapes else null };
+     }
+ 
+-    const vt = g.hooks(Case);
++    pub const vt = g.hooks(Case);
+ 
+     fn random16(rng: std.Random, out: []u16) void {
+         for (out) |*v| v.* = @bitCast(@as(f16, @floatCast(rng.float(f32) * 2 - 1)));
+@@ -191,7 +195,7 @@ pub const Case = struct {
+         const a = self.rig.gpu.gpa;
+         var prng = std.Random.DefaultPrng.init(seed);
+         const rng = prng.random();
+-        const widths: []const usize = if (grouped) members(shape.n) else &.{shape.n};
++        const widths: []const usize = if (!grouped) &.{shape.n} else if (self.ext) |e| e.members(shape.n) else members(shape.n);
+         self.nm = widths.len;
+         const width = fmt.Width{ .halves = @intCast(self.halves) };
+         var zb: usize = 0;
+@@ -216,7 +220,7 @@ pub const Case = struct {
+             zb += @max(exl3.Linear.zBytes(m.w, 128), exl3.Linear.zBytes(other(m.w), 128));
+             cb += exl3.Linear.counterBytes(m.w);
+         }
+-        if (grouped and !exl3.groupable(self.weights(), shape.rows)) return false;
++        if (grouped and !(if (self.ext) |e| e.fits(self.weights(), shape.rows) else exl3.groupable(self.weights(), shape.rows))) return false;
+         self.x = try a.alloc(u16, shape.rows * shape.k);
+         for (self.x) |*v| v.* = c.toBf16(rng.float(f32) * 2 - 1);
+         switch (fill) {
+@@ -260,8 +264,8 @@ pub const Case = struct {
+         return self.shape.rows * n;
+     }
+ 
+-    fn ys(self: *const Case, at: u64) [3]u64 {
+-        var y: [3]u64 = .{ 0, 0, 0 };
++    pub fn ys(self: *const Case, at: u64) [5]u64 {
++        var y: [5]u64 = @splat(0);
+         var off: u64 = 0;
+         for (self.mats[0..self.nm], 0..) |m, i| {
+             y[i] = at + off;
+@@ -283,14 +287,14 @@ pub const Case = struct {
+             },
+             .group, .rot_group => {
+                 var ws = self.weights();
+-                var bad: [3]exl3.Weight = undefined;
++                var bad: [5]exl3.Weight = undefined;
+                 if (self.control) {
+                     @memcpy(bad[0..self.nm], ws);
+                     if (self.kind == .group) bad[1].svh = bad[0].svh else bad[1].suh = bad[0].suh;
+                     ws = bad[0..self.nm];
+                 }
+                 const y = self.ys(if (self.kind == .group) self.out else self.base);
+-                try self.lin.matmulGroup(self.rig.s, ws, self.xd, .bf16, m, y[0..self.nm], .bf16, if (self.kind == .rot_group) self.out else self.xh, self.z, self.counters);
++                if (self.ext) |e| try e.run(self, ws, y[0..self.nm]) else try self.lin.matmulGroup(self.rig.s, ws, self.xd, .bf16, m, y[0..self.nm], .bf16, if (self.kind == .rot_group) self.out else self.xh, self.z, self.counters);
+             },
+         }
+         try self.rig.s.synchronize();
+diff --git a/zig/tests/cuda/contract_inkling2.zig b/zig/tests/cuda/contract_inkling2.zig
+index 71758563f..c401ac6e6 100644
+--- a/zig/tests/cuda/contract_inkling2.zig
++++ b/zig/tests/cuda/contract_inkling2.zig
+@@ -1,4 +1,4 @@
+-//! Inkling 2's CUDA kernels under the contract: attention, glue, drafter, experts and tower, each with controls.
++//! Inkling 2's CUDA kernels under the contract: attention, glue, drafter, experts, tower, Mini's loop and groups.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const check = @import("check.zig");
+@@ -11,6 +11,8 @@ pub const Set = struct {
+     ops: @import("contract_inkling2_ops.zig").Set = .{},
+     dspark: @import("contract_inkling2_dspark.zig").Set = .{},
+     experts: @import("contract_inkling2_experts.zig").Set = .{},
++    loop: @import("contract_inkling2_loop.zig").Set = .{},
++    group5: @import("contract_inkling2_group5.zig").Set = .{},
+ 
+     /// The set, its kernels appended to `list`.
+     pub fn init(gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !*Set {
+@@ -24,10 +26,16 @@ pub const Set = struct {
+         try set.dspark.init(gpu, s, a, list);
+         errdefer set.dspark.deinit();
+         try set.experts.init(gpu, s, a, list);
++        errdefer set.experts.deinit();
++        try set.loop.init(gpu, s, a, list);
++        errdefer set.loop.deinit();
++        try set.group5.add(gpu, s, a, list);
+         return set;
+     }
+ 
+     pub fn deinit(set: *Set) void {
++        set.group5.deinit();
++        set.loop.deinit();
+         set.experts.deinit();
+         set.dspark.deinit();
+         set.ops.deinit();
+diff --git a/zig/tests/cuda/contract_inkling2_dspark.zig b/zig/tests/cuda/contract_inkling2_dspark.zig
+index 387b85ec5..ff39023fe 100644
+--- a/zig/tests/cuda/contract_inkling2_dspark.zig
++++ b/zig/tests/cuda/contract_inkling2_dspark.zig
+@@ -21,8 +21,8 @@ pub const Set = struct {
+     silus: [2]ref.Gated(glue.Silu) = undefined,
+     ctxs: [2]ref.Gated(head.Ctx) = undefined,
+     rnns: [2]ref.Gated(head.Rnn) = undefined,
+-    vocabs: [2]head.Banded(head.Vocab) = undefined,
+-    picks: [2]ref.Checked(glue.Pick) = undefined,
++    vocabs: [4]head.Banded(head.Vocab) = undefined,
++    picks: [4]ref.Checked(glue.Pick) = undefined,
+ 
+     pub fn init(set: *Set, gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
+         set.k = try dk.Kernels.load(gpu.d);
+@@ -37,8 +37,8 @@ pub const Set = struct {
+         for (&set.silus, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .swapped = i == 1 } };
+         for (&set.ctxs, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .early = i == 1 } };
+         for (&set.rnns, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .late = i == 1 } };
+-        for (&set.vocabs, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .short = i == 1 } } };
+-        for (&set.picks, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .alone = i == 1 } };
++        for (&set.vocabs, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .short = i % 2 == 1, .rows = i >= 2 } } };
++        for (&set.picks, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .alone = i % 2 == 1, .rows = i >= 2 } };
+         for (&set.mixes) |*x| try list.append(a, x.kernel());
+         for (&set.adds) |*x| try list.append(a, x.kernel());
+         for (&set.qks) |*x| try list.append(a, x.kernel());
+diff --git a/zig/tests/cuda/contract_inkling2_dspark_glue.zig b/zig/tests/cuda/contract_inkling2_dspark_glue.zig
+index bd7c7b5a1..4ed62d3d0 100644
+--- a/zig/tests/cuda/contract_inkling2_dspark_glue.zig
++++ b/zig/tests/cuda/contract_inkling2_dspark_glue.zig
+@@ -93,7 +93,11 @@ const pick_rule = "walk[j + 1]: the largest value over the ranks, the lowest id
+     "a NaN never wins; with every value NaN the id is 0x7fffffff";
+ 
+ /// Drafts (a launch each) x ranks (TP=2) x 1: every rank's (value, id) 16 bytes apart.
+-pub fn pickSpec(alone: bool) c.Spec {
++pub fn pickSpec(alone: bool, rows: bool) c.Spec {
++    if (rows) {
++        const rname = if (alone) "inkling2 dspark control: tf_ink2_dsp_pick_rows reads rank 0's entries alone" else "inkling2 dspark tf_ink2_dsp_pick_rows (every stream's best into its walk)";
++        return .{ .name = rname, .accum = .none, .depth = ref.noSums, .out = .raw, .nan = .{ .stated = pick_rule }, .served = &.{ .{ .rows = 8, .n = 2, .k = 1 }, .{ .rows = 2, .n = 2, .k = 1 }, .{ .rows = 5, .n = 2, .k = 1 } } };
++    }
+     const name = if (alone) "inkling2 dspark control: the pick reads rank 0's entry alone" else "inkling2 dspark tf_ink2_dsp_pick (the ranks' best into the walk)";
+     return .{ .name = name, .accum = .none, .depth = ref.noSums, .out = .raw, .nan = .{ .stated = pick_rule }, .served = &.{ .{ .rows = 7, .n = 2, .k = 1 }, .{ .rows = 1, .n = 2, .k = 1 } } };
+ }
+@@ -105,6 +109,8 @@ pub const Pick = struct {
+     kern: *const dk.Kernels,
+     /// control: launched with one rank
+     alone: bool = false,
++    /// tf_ink2_dsp_pick_rows: the shape's rows as streams (rank q's row r at (q * rows + r) * 16 bytes), one launch
++    rows: bool = false,
+     shape: c.Shape = undefined,
+     vals: []f32 = &.{},
+     ids: []i32 = &.{},
+@@ -112,7 +118,7 @@ pub const Pick = struct {
+     out: u64 = 0,
+ 
+     pub fn spec(self: *const Pick) c.Spec {
+-        return pickSpec(self.alone);
++        return pickSpec(self.alone, self.rows);
+     }
+ 
+     pub fn control(self: *const Pick) ?g.Gate {
+@@ -152,8 +158,9 @@ pub const Pick = struct {
+         defer a.free(bytes);
+         @memset(bytes, 0x5a);
+         for (self.vals, self.ids, 0..) |v, id, i| {
+-            std.mem.writeInt(u32, bytes[i * stride ..][0..4], @bitCast(v), .little);
+-            std.mem.writeInt(i32, bytes[i * stride + 4 ..][0..4], id, .little);
++            const at = if (self.rows) (i % 2 * shape.rows + i / 2) * stride else i * stride;
++            std.mem.writeInt(u32, bytes[at..][0..4], @bitCast(v), .little);
++            std.mem.writeInt(i32, bytes[at + 4 ..][0..4], id, .little);
+         }
+         self.dev = try rig.input(bytes);
+         self.out = try rig.output((shape.rows + 1) * 4);
+@@ -162,6 +169,7 @@ pub const Pick = struct {
+ 
+     pub fn run(self: *Pick, rig: *rig_.Rig) !void {
+         const world: usize = if (self.alone) 1 else 2;
++        if (self.rows) return dk.pickRows(self.kern, rig.s, self.dev, world, self.shape.rows, self.out, 1, 0);
+         for (0..self.shape.rows) |j| try dk.pick(self.kern, rig.s, self.dev + j * 2 * stride, world, self.out, j);
+     }
+ 
+diff --git a/zig/tests/cuda/contract_inkling2_dspark_head.zig b/zig/tests/cuda/contract_inkling2_dspark_head.zig
+index 31572711c..6936dd3f8 100644
+--- a/zig/tests/cuda/contract_inkling2_dspark_head.zig
++++ b/zig/tests/cuda/contract_inkling2_dspark_head.zig
+@@ -301,9 +301,14 @@ fn validOf(n: usize) usize {
+ }
+ 
+ /// Steps (one launch each) x the rank's vocabulary rows x the rank-256 latent.
+-pub fn vocabSpec(short: bool) c.Spec {
++pub fn vocabSpec(short: bool, rows: bool) c.Spec {
+     const served = &[_]c.Shape{ .{ .rows = 7, .n = 100_608, .k = R }, .{ .rows = 1, .n = 100_480, .k = R }, .{ .rows = 2, .n = 3000, .k = R } };
++    const streams = &[_]c.Shape{ .{ .rows = 8, .n = 100_608, .k = R }, .{ .rows = 2, .n = 100_480, .k = R }, .{ .rows = 5, .n = 3000, .k = R } };
+     const name = if (short) "inkling2 dspark control: the vocabulary's last real row taken as padding" else "inkling2 dspark tf_ink2_dsp_vocab (softcap(base + fold . latent), -Inf past the real rows)";
++    if (rows) {
++        const rname = if (short) "inkling2 dspark control: tf_ink2_dsp_vocab_rows told one real row fewer" else "inkling2 dspark tf_ink2_dsp_vocab_rows (every stream's step in one launch)";
++        return .{ .name = rname, .accum = .f32, .depth = vocabDepth, .out = .f32, .served = streams, .sums = .{} };
++    }
+     return .{ .name = name, .accum = .f32, .depth = vocabDepth, .out = .f32, .served = served, .sums = .{} };
+ }
+ 
+@@ -312,6 +317,8 @@ pub const Vocab = struct {
+     kern: *const dk.Kernels,
+     /// control: launched with one real row fewer
+     short: bool = false,
++    /// tf_ink2_dsp_vocab_rows: the shape's rows as streams, in one launch
++    rows: bool = false,
+     shape: c.Shape = undefined,
+     base: []u16 = &.{},
+     latent: []u16 = &.{},
+@@ -323,7 +330,7 @@ pub const Vocab = struct {
+     pub const sums = {};
+ 
+     pub fn spec(self: *const Vocab) c.Spec {
+-        return vocabSpec(self.short);
++        return vocabSpec(self.short, self.rows);
+     }
+ 
+     pub fn control(self: *const Vocab) ?g.Gate {
+@@ -376,6 +383,7 @@ pub const Vocab = struct {
+     pub fn run(self: *Vocab, rig: *rig_.Rig) !void {
+         const n = self.shape.n;
+         const valid = validOf(n) - @intFromBool(self.short);
++        if (self.rows) return dk.vocabRows(self.kern, rig.s, self.in[0], n, self.in[1], self.in[2], self.in[3], cap, valid, n, self.shape.rows, self.out);
+         for (0..self.shape.rows) |j| try dk.vocab(self.kern, rig.s, self.in[0] + j * n * 2, self.in[1] + j * R * 2, self.in[2], self.in[3], cap, valid, n, self.out + j * n * 4);
+     }
+ 
+diff --git a/zig/tests/cuda/contract_inkling2_group5.zig b/zig/tests/cuda/contract_inkling2_group5.zig
+new file mode 100644
+index 000000000..d5b71d7cd
+--- /dev/null
++++ b/zig/tests/cuda/contract_inkling2_group5.zig
+@@ -0,0 +1,115 @@
++//! Mini's five-way projection groups under the contract: tf_exl3_group5_* and tf_exl3_rot_group5 against linear_body.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const check = @import("check.zig");
++const x3 = @import("contract_exl3.zig");
++const pg = @import("inkling2").proj_group;
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const exl3 = cuda.exl3;
++
++fn sh(rows: usize, n: usize, k: usize) c.Shape {
++    return .{ .rows = rows, .n = n, .k = k };
++}
++
++/// n names the members at K 2304: a TP=2 rank's q, gate, r (held whole), k, v; one rank's; two wide layers (8 warps).
++fn members(n: usize) []const usize {
++    return switch (n) {
++        4480 => &.{ 1536, 1536, 384, 512, 512 },
++        8576 => &.{ 3072, 3072, 384, 1024, 1024 },
++        16384 => &.{ 8192, 8192 },
++        else => &.{ 1536, 512 },
++    };
++}
++
++const narrow = [_]c.Shape{ sh(1, 4480, 2304), sh(16, 4480, 2304), sh(7, 8576, 2304), sh(16, 2048, 2304), sh(3, 2048, 2304) };
++const wide = [_]c.Shape{ sh(1, 16384, 2304), sh(4, 16384, 2304) };
++
++fn fits(ws: []const exl3.Weight, rows: usize) bool {
++    var ms: [pg.max_members]pg.Member = undefined;
++    for (ws, 0..) |w, i| ms[i] = .{ .w = w, .x = 0, .y = 0, .dt = .bf16 };
++    return pg.Group.fits(ms[0..ws.len], rows);
++}
++
++/// The projections' one group (the set's), shared by every case: Group.run as the forward calls it.
++var group: ?pg.Group = null;
++
++fn runLinear(cs: *x3.Case, ws: []const exl3.Weight, ys: []const u64) !void {
++    var ms: [pg.max_members]pg.Member = undefined;
++    for (ws, ys, 0..) |w, y, i| ms[i] = .{ .w = w, .x = cs.xd, .y = y, .dt = .bf16 };
++    try group.?.run(cs.rig.s, ms[0..ws.len], cs.shape.rows);
++}
++
++/// proj_group's RotC: each member's rotated input straight into the case's output, member after member.
++const RotC = extern struct { x: [pg.max_members]u64, suh: [pg.max_members]u64, xh: [pg.max_members]u64, x_dtype: i32, m: i32, k: i32 };
++
++fn runRot(cs: *x3.Case, ws: []const exl3.Weight, _: []const u64) !void {
++    const rows = cs.shape.rows;
++    const k = cs.shape.k;
++    var r: RotC = .{ .x = @splat(0), .suh = @splat(0), .xh = @splat(0), .x_dtype = @backingInt(exl3.DType.bf16), .m = @intCast(rows), .k = @intCast(k) };
++    for (ws, 0..) |w, i| {
++        r.x[i] = cs.xd;
++        r.suh[i] = w.suh;
++        r.xh[i] = cs.out + i * rows * k * 2;
++    }
++    var a: cuda.Args = .{};
++    a.add(r);
++    try cuda.launch.launch(group.?.rot, .{ .grid = .{ .x = @intCast((k / 128 + 3) / 4), .y = @intCast(rows), .z = @intCast(ws.len) }, .block = .{ .x = 128 } }, cs.rig.s, &a);
++}
++
++const lin_ext: x3.Ext = .{ .members = members, .fits = fits, .run = runLinear };
++const rot_ext: x3.Ext = .{ .members = members, .fits = fits, .run = runRot };
++
++/// A registration: a width (halves) and warp count's group5 kernel, or the rotation, or a control posing as one.
++const Reg = struct { rot: bool = false, h: u32 = 12, wk: u32 = 4, ctl: bool = false };
++const registrations = [_]Reg{
++    .{ .h = 8 },      .{ .h = 8, .wk = 8 }, .{ .h = 10 },                  .{ .h = 10, .wk = 8 }, .{ .h = 12 }, .{ .h = 12, .wk = 8 },
++    .{ .rot = true }, .{ .ctl = true },     .{ .rot = true, .ctl = true },
++};
++
++fn spec(r: Reg) c.Spec {
++    var s = x3.spec(if (r.rot) .rot_group else .group, 8, r.ctl);
++    s.served = if (r.wk == 8) &wide else &narrow;
++    inline for (.{ 8, 10, 12 }) |h| inline for (.{ 4, 8 }) |wk| if (!r.rot and r.h == h and r.wk == wk) {
++        s.name = if (r.ctl) "control: exl3 group5 with a member's scales swapped posing as its members' linear_body" else std.fmt.comptimePrint("cuda exl3 tf_exl3_group5_{d}_2_{d} (a visit's projections, 1-16 rows)", .{ h, wk });
++    };
++    if (r.rot) s.name = if (r.ctl) "control: exl3 rot_group5 with a member's suh swapped posing as rot_in" else "cuda exl3 tf_exl3_rot_group5 (a visit's rotated inputs, 1-16 rows)";
++    return s;
++}
++
++pub const Set = struct {
++    lin: ?exl3.Linear = null,
++    cases: [registrations.len]x3.Case = undefined,
++    n: usize = 0,
++
++    /// The cases on one Linear and one Group, appended to `list` (the cases point into the set: it must not move).
++    pub fn add(self: *Set, gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
++        self.lin = try exl3.Linear.load(gpu.d);
++        group = try pg.Group.init(gpu.d, &self.lin.?);
++        for (registrations) |r| {
++            self.cases[self.n] = .{ .rig = .{ .gpu = gpu, .s = s }, .lin = &self.lin.?, .kind = if (r.rot) .rot_group else .group, .halves = r.h, .control = r.ctl, .ext = if (r.rot) &rot_ext else &lin_ext };
++            try list.append(a, .{ .spec = spec(r), .ctx = &self.cases[self.n], .vt = &x3.Case.vt, .control = if (r.ctl) .shapes else null });
++            self.n += 1;
++        }
++    }
++
++    pub fn deinit(self: *Set) void {
++        for (self.cases[0..self.n]) |*cs| cs.deinit();
++        if (group) |*x| x.deinit();
++        group = null;
++        if (self.lin) |*l| l.unload();
++        self.lin = null;
++    }
++};
++
++test "contract_inkling2_group5: each registration's shapes reach its kernel's width and warps" {
++    for (registrations) |r| if (!r.rot) for (spec(r).served) |s| {
++        var ws: [pg.max_members]exl3.Weight = undefined;
++        const ns = members(s.n);
++        for (ns, 0..) |n, i| ws[i] = .{ .trellis = 0, .suh = 0, .svh = 0, .k = @intCast(s.k), .n = @intCast(n), .halves = r.h, .codebook = .mul1, .stride_k = 0, .stride_nb = 0 };
++        try std.testing.expect(fits(ws[0..ns.len], s.rows));
++        try std.testing.expectEqual(r.wk, exl3.planOf(ws[0]).wk);
++    };
++}
+diff --git a/zig/tests/cuda/contract_inkling2_loop.zig b/zig/tests/cuda/contract_inkling2_loop.zig
+new file mode 100644
+index 000000000..6530f7835
+--- /dev/null
++++ b/zig/tests/cuda/contract_inkling2_loop.zig
+@@ -0,0 +1,45 @@
++//! Mini's loop kernels (inkling2/loop.cu) under the contract, each control after the kernel it breaks.
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const g = @import("core").contract.gates;
++const lp = @import("inkling2").loop;
++const ref = @import("contract_inkling2_ops_ref.zig");
++const ops = @import("contract_inkling2_loop_ops.zig");
++const gate = @import("contract_inkling2_loop_gate.zig");
++
++const G = ref.Gated;
++const groups = .{ "msgs", "downs", "blends", "mixes", "norms", "banks" };
++
++pub const Set = struct {
++    k: lp.Kernels = undefined,
++    loaded: bool = false,
++    msgs: [3]G(gate.Msg) = undefined,
++    downs: [4]G(gate.Down) = undefined,
++    blends: [2]G(gate.Blend) = undefined,
++    mixes: [3]G(ops.Mix) = undefined,
++    norms: [2]G(ops.Norm) = undefined,
++    banks: [2]G(ops.Bank) = undefined,
++
++    /// Every registration appended to `list`.
++    pub fn init(set: *Set, gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
++        set.k = try lp.Kernels.load(gpu.d);
++        set.loaded = true;
++        const k = &set.k;
++        const rig: @import("contract_rig.zig").Rig = .{ .gpu = gpu, .s = s };
++        for (&set.msgs, [_]gate.View{ .msg, .pair, .msg }, 0..) |*x, v, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .view = v, .wrong = i == 2 } };
++        for (&set.downs, [_]gate.Width{ .o8, .o16, .o64, .o8 }, 0..) |*x, w, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .width = w, .swapped = i == 3 } };
++        for (&set.blends, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .swapped = i == 1 } };
++        for (&set.mixes, [_]ops.Form{ .attn, .mlp, .mlp }, 0..) |*x, f, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .form = f, .short = i == 2 } };
++        for (&set.norms, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .one = i == 1 } };
++        for (&set.banks, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .wrong = i == 1 } };
++        inline for (groups) |f| for (&@field(set, f)) |*x| try list.append(a, x.kernel());
++    }
++
++    pub fn deinit(set: *Set) void {
++        if (!set.loaded) return;
++        inline for (groups) |f| for (&@field(set, f)) |*x| x.deinit();
++        set.k.unload();
++        set.loaded = false;
++    }
++};
+diff --git a/zig/tests/cuda/contract_inkling2_loop_gate.zig b/zig/tests/cuda/contract_inkling2_loop_gate.zig
+new file mode 100644
+index 000000000..24ff06d20
+--- /dev/null
++++ b/zig/tests/cuda/contract_inkling2_loop_gate.zig
+@@ -0,0 +1,454 @@
++//! Mini's loop gates under the contract: tf_ink2_loop_msg, tf_ink2_loop_down8/16/64 and tf_ink2_loop_blend.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const ref = @import("contract_inkling2_ops_ref.zig");
++const lp = @import("inkling2").loop;
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const Iv = ref.Iv;
++const Sums = ref.Sums;
++const W = lp.width;
++const R = 64; // gate_rank
++const P = 2 * W; // the down projection's input
++const sources = 2; // Mini's bank: the previous pass's blocks after its first, then its output
++const split = 9;
++
++fn launch(f: cuda.Function, s: cuda.Stream, grid: cuda.Dim3, threads: u32, a: *cuda.Args) !void {
++    try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = threads } }, s, a);
++}
++
++/// Served launches: decode rows, a 16-row window, prompt passes of 37, 128 and 2048 rows; 3 gates (q, k, v) or 1.
++const served = [_]c.Shape{ .{ .rows = 1, .n = W, .k = 3 }, .{ .rows = 16, .n = W, .k = 1 }, .{ .rows = 37, .n = W, .k = 3 }, .{ .rows = 128, .n = W, .k = 1 }, .{ .rows = 2048, .n = W, .k = 1 } };
++
++/// Each gate's weights (down [R][2W], forget and gain [W][R]), as the launch's Gates take them.
++const Weights = struct {
++    down: []u16 = &.{},
++    forget: []u16 = &.{},
++    gain: []u16 = &.{},
++    dev: lp.Gates = .{ .down = @splat(0), .forget = @splat(0), .gain = @splat(0) },
++
++    fn free(w: *Weights, a: std.mem.Allocator) void {
++        inline for (.{ "down", "forget", "gain" }) |f| {
++            a.free(@field(w, f));
++            @field(w, f) = &.{};
++        }
++    }
++
++    /// Weights in [-0.25, 0.25) for `gates` gates, uploaded; the fourth place repeats the last gate.
++    fn make(w: *Weights, a: std.mem.Allocator, rig: *rig_.Rig, rng: std.Random, gates: usize) !void {
++        w.free(a);
++        w.down = try ref.bfs(a, rng, gates * R * P, -0.25, 0.25);
++        w.forget = try ref.bfs(a, rng, gates * W * R, -0.25, 0.25);
++        w.gain = try ref.bfs(a, rng, gates * W * R, -0.25, 0.25);
++        try w.upload(rig, gates);
++    }
++
++    fn upload(w: *Weights, rig: *rig_.Rig, gates: usize) !void {
++        for (0..4) |i| {
++            const j = @min(i, gates - 1);
++            if (i < gates) {
++                w.dev.down[i] = try ref.input(rig, w.down[j * R * P ..][0 .. R * P]);
++                w.dev.forget[i] = try ref.input(rig, w.forget[j * W * R ..][0 .. W * R]);
++                w.dev.gain[i] = try ref.input(rig, w.gain[j * W * R ..][0 .. W * R]);
++            } else {
++                w.dev.down[i] = w.dev.down[j];
++                w.dev.forget[i] = w.dev.forget[j];
++                w.dev.gain[i] = w.dev.gain[j];
++            }
++        }
++    }
++};
++
++/// A thread's 9 values in order, its warp's 5 shuffles, the 8 warp sums in order.
++fn msgDepth(_: c.Shape) usize {
++    return 9 + 5 + 8;
++}
++
++/// The message kernel's two outputs, one registration each: msg (fp32) and the down input pair (bf16).
++pub const View = enum { msg, pair };
++
++pub fn msgSpec(v: View, wrong: bool) c.Spec {
++    const names = [2][]const u8{ "inkling2 loop tf_ink2_loop_msg messages (attention over the bank, fp32)", "inkling2 loop tf_ink2_loop_msg down inputs ([norm(h); norm(msg)], bf16)" };
++    if (wrong) return .{ .name = "control: inkling2 loop tf_ink2_loop_msg told one bank source", .accum = .f32, .depth = msgDepth, .out = .f32, .served = served[0..1] };
++    return .{ .name = names[@backingInt(v)], .accum = .f32, .depth = msgDepth, .out = if (v == .msg) .f32 else .bf16, .served = &served };
++}
++
++pub const Msg = struct {
++    kern: *const lp.Kernels,
++    view: View,
++    wrong: bool = false,
++    shape: c.Shape = undefined,
++    bank: []f32 = &.{},
++    q: []f32 = &.{},
++    h: []f32 = &.{}, // [gates][rows][W] (one gate: [rows][W])
++    w: Weights = .{},
++    in: [3]u64 = @splat(0),
++    msg: u64 = 0,
++    pair: u64 = 0,
++
++    pub const sums = {};
++
++    pub fn spec(self: *const Msg) c.Spec {
++        return msgSpec(self.view, self.wrong);
++    }
++
++    pub fn control(self: *const Msg) ?g.Gate {
++        return if (self.wrong) .shapes else null;
++    }
++
++    pub fn free(self: *Msg, a: std.mem.Allocator) void {
++        a.free(self.bank);
++        a.free(self.q);
++        a.free(self.h);
++        self.bank = &.{};
++        self.q = &.{};
++        self.h = &.{};
++        self.w.free(a);
++    }
++
++    /// States in [-3, 3) with one in 41 eight times larger, queries in [-1, 1); stress: integer states.
++    pub fn prepare(self: *Msg, a: std.mem.Allocator, rig: *rig_.Rig, shape: c.Shape, fill: g.Fill, rng: std.Random) !bool {
++        if (shape.rows == 0 or shape.n != W or shape.k < 1 or shape.k > 3) return false;
++        self.free(a);
++        self.shape = shape;
++        const rows = shape.rows;
++        const stress = fill == .stress;
++        self.bank = try a.alloc(f32, rows * sources * W);
++        self.h = try a.alloc(f32, shape.k * rows * W);
++        for ([_][]f32{ self.bank, self.h }) |xs| for (xs, 0..) |*v, i| {
++            v.* = if (stress) ref.int(rng, -48, 48) else (rng.float(f32) * 6 - 3) * (if (i % 41 == 7) @as(f32, 8) else 1);
++        };
++        // stress: zero queries, so the softmax is exactly even and gate 4 sees the norms alone
++        self.q = try a.alloc(f32, shape.k * W);
++        for (self.q) |*v| v.* = if (stress) 0 else rng.float(f32) * 2 - 1;
++        if (fill == .nonfinite) {
++            ref.plant(f32, self.bank, @min(rows * sources, 4), W, ref.asF32);
++            if (rows > 1) ref.plant(f32, self.h[W..], @min(rows - 1, 3), W, ref.asF32);
++        }
++        try self.w.make(a, rig, rng, shape.k);
++        self.in = .{ try ref.input(rig, self.bank), try ref.input(rig, self.q), try ref.input(rig, self.h) };
++        const n = rows * shape.k * W;
++        if (self.view == .msg or self.wrong) {
++            self.msg = try rig.output(n * 4);
++            self.pair = try rig.scratch(n * 4);
++        } else {
++            self.msg = try rig.scratch(n * 4);
++            self.pair = try rig.output(n * 4);
++        }
++        return true;
++    }
++
++    pub fn run(self: *Msg, rig: *rig_.Rig) !void {
++        const rows = self.shape.rows;
++        const gates = self.shape.k;
++        var a: cuda.Args = .{};
++        a.add(self.in[0]);
++        a.add(@as(i32, if (self.wrong) sources - 1 else sources));
++        a.add(self.in[1]);
++        a.add(self.in[2]);
++        a.add(@as(i64, W));
++        a.add(@as(i64, if (gates == 1) 0 else @as(i64, @intCast(rows * W))));
++        a.add(@as(i32, @intCast(gates)));
++        a.add(@as(f32, @floatCast(std.math.pow(f64, W, -0.5))));
++        a.add(ref.eps);
++        a.add(self.w.dev);
++        a.add(self.msg);
++        a.add(self.pair);
++        try launch(self.kern.msg, rig.s, .{ .x = @intCast(rows * gates) }, 256, &a);
++    }
++
++    pub fn count(self: *const Msg) usize {
++        return self.shape.rows * self.shape.k * @as(usize, if (self.view == .pair and !self.wrong) P else W);
++    }
++
++    /// Per (row, gate): RMS-normed bank states as keys and values, a softmax of q . k / sqrt(W), the mix, both norms.
++    pub fn solve(self: *const Msg, a: std.mem.Allocator, s: Sums, out: []Iv) !void {
++        const rows = self.shape.rows;
++        const gates = self.shape.k;
++        const terms = try a.alloc(Iv, W);
++        defer a.free(terms);
++        const scratch = try a.alloc(f64, W);
++        defer a.free(scratch);
++        const e = try a.alloc(Iv, sources * W);
++        defer a.free(e);
++        const mv = try a.alloc(Iv, W);
++        defer a.free(mv);
++        const d = msgDepth(self.shape);
++        const scale = Iv.of(@as(f32, @floatCast(std.math.pow(f64, W, -0.5))));
++        const st = ref.later(s);
++        for (0..rows) |r| for (0..gates) |gi| {
++            const hv = self.h[(gi * rows + r) * W ..][0..W];
++            const qv = self.q[gi * W ..][0..W];
++            for (terms, hv) |*t, v| t.* = Iv.of(v).mul(Iv.of(v));
++            const rh = ref.rms(s.sum(terms, d, scratch), W, ref.eps);
++            var p: [sources]Iv = undefined;
++            for (0..sources) |src| {
++                const b = self.bank[(r * sources + src) * W ..][0..W];
++                for (terms, b) |*t, v| t.* = Iv.of(v).mul(Iv.of(v));
++                const rs = ref.rms(s.sum(terms, d, scratch), W, ref.eps);
++                for (e[src * W ..][0..W], b) |*x, v| x.* = Iv.of(v).mul(rs);
++                for (terms, qv, e[src * W ..][0..W]) |*t, q, x| t.* = Iv.of(q).mul(x);
++                p[src] = st.sum(terms, d, scratch).mul(scale);
++            }
++            var m = p[0];
++            for (p[1..]) |v| m = .{ .m = @max(m.m, v.m), .lo = @max(m.lo, v.lo), .hi = @max(m.hi, v.hi) };
++            var den = Iv.of(0);
++            for (&p) |*v| {
++                v.* = v.sub(m).exp();
++                den = den.add(v.*);
++            }
++            for (&p) |*v| v.* = v.div(den);
++            for (mv, 0..) |*x, j| {
++                var acc = Iv.of(0);
++                for (0..sources) |src| acc = acc.add(p[src].mul(e[src * W + j]));
++                x.* = acc;
++            }
++            const o = r * gates + gi;
++            if (self.view == .msg or self.wrong) {
++                @memcpy(out[o * W ..][0..W], mv);
++                continue;
++            }
++            for (terms, mv) |*t, x| t.* = ref.sq(x).mul(Iv.of(1));
++            const rm = ref.rms(st.sum(terms, d, scratch), W, ref.eps);
++            for (out[o * P ..][0..W], hv) |*y, v| y.* = Iv.of(v).mul(rh).bf();
++            for (out[o * P + W ..][0..W], mv) |*y, x| y.* = x.mul(rm).bf();
++        };
++    }
++};
++
++/// A warp's 8 mma k-steps of 16 (a tensor-core add may truncate: twice its chain), the 4 quarters, the 9 slices.
++fn downDepth(_: c.Shape) usize {
++    return 2 * 128 + 3 + split;
++}
++
++/// Outputs a block: down8 (8), down16 (16), down64 (64); loop.zig picks by rows, none moving a bit.
++pub const Width = enum { o8, o16, o64 };
++
++pub fn downSpec(o: Width, swapped: bool) c.Spec {
++    const names = [3][]const u8{ "inkling2 loop tf_ink2_loop_down8 (g = down . pair, fixed K cut, 8 outputs a block)", "inkling2 loop tf_ink2_loop_down16 (g = down . pair, fixed K cut, 16 outputs a block)", "inkling2 loop tf_ink2_loop_down64 (g = down . pair, fixed K cut, 64 outputs a block)" };
++    const shapes = [3][]const c.Shape{ &.{ .{ .rows = 1, .n = R, .k = 3 }, .{ .rows = 16, .n = R, .k = 1 }, .{ .rows = 9, .n = R, .k = 3 } }, &.{ .{ .rows = 17, .n = R, .k = 3 }, .{ .rows = 128, .n = R, .k = 1 }, .{ .rows = 37, .n = R, .k = 3 } }, &.{ .{ .rows = 129, .n = R, .k = 3 }, .{ .rows = 2048, .n = R, .k = 1 } } };
++    if (swapped) return .{ .name = "control: inkling2 loop tf_ink2_loop_down8 with gate 0's weights in gate 1's place", .accum = .f32, .depth = downDepth, .out = .bf16, .served = shapes[0][0..1] };
++    return .{ .name = names[@backingInt(o)], .accum = .f32, .depth = downDepth, .out = .bf16, .served = shapes[@backingInt(o)] };
++}
++
++pub const Down = struct {
++    kern: *const lp.Kernels,
++    width: Width,
++    swapped: bool = false,
++    shape: c.Shape = undefined,
++    pair: []u16 = &.{},
++    w: Weights = .{},
++    in: [2]u64 = @splat(0), // pair, the zeroed counts
++    part: u64 = 0,
++    out: u64 = 0,
++
++    pub const sums = {};
++
++    pub fn spec(self: *const Down) c.Spec {
++        return downSpec(self.width, self.swapped);
++    }
++
++    pub fn control(self: *const Down) ?g.Gate {
++        return if (self.swapped) .shapes else null;
++    }
++
++    pub fn free(self: *Down, a: std.mem.Allocator) void {
++        a.free(self.pair);
++        self.pair = &.{};
++        self.w.free(a);
++    }
++
++    /// Inputs in [-2, 2), weights in [-0.25, 0.25); stress: integers (inputs to 48, weights to 8), exact in fp32.
++    pub fn prepare(self: *Down, a: std.mem.Allocator, rig: *rig_.Rig, shape: c.Shape, fill: g.Fill, rng: std.Random) !bool {
++        if (shape.rows == 0 or shape.n != R or shape.k < 1 or shape.k > 3) return false;
++        self.free(a);
++        self.shape = shape;
++        const rows = shape.rows;
++        self.pair = try ref.bfs(a, rng, rows * shape.k * P, -2, 2);
++        try self.w.make(a, rig, rng, shape.k);
++        if (fill == .stress) {
++            for (self.pair) |*v| v.* = c.toBf16(ref.int(rng, -48, 48));
++            for (self.w.down) |*v| v.* = c.toBf16(ref.int(rng, -8, 8));
++            try self.w.upload(rig, shape.k);
++        }
++        if (fill == .nonfinite) ref.plant(u16, self.pair, @min(rows * shape.k, 4), P, ref.asBf);
++        const counts = try a.alloc(u32, (rows + 15) / 16 * shape.k * 8);
++        defer a.free(counts);
++        @memset(counts, 0);
++        self.in = .{ try ref.input(rig, self.pair), try ref.input(rig, counts) };
++        self.part = try rig.scratch(rows * shape.k * split * R * 4);
++        self.out = try rig.output(rows * shape.k * R * 2);
++        return true;
++    }
++
++    pub fn run(self: *Down, rig: *rig_.Rig) !void {
++        const rows = self.shape.rows;
++        const gates = self.shape.k;
++        var w = self.w.dev;
++        if (self.swapped) w.down[1] = w.down[0];
++        const outs: usize = switch (self.width) {
++            .o8 => 8,
++            .o16 => 16,
++            .o64 => 64,
++        };
++        var a: cuda.Args = .{};
++        a.add(self.in[0]);
++        a.add(w);
++        a.add(@as(i32, @intCast(rows)));
++        a.add(@as(i32, @intCast(gates)));
++        a.add(self.part);
++        a.add(self.in[1]);
++        a.add(self.out);
++        const f = switch (self.width) {
++            .o8 => self.kern.down8,
++            .o16 => self.kern.down16,
++            .o64 => self.kern.down64,
++        };
++        try launch(f, rig.s, .{ .x = @intCast((rows + 15) / 16), .y = split, .z = @intCast(gates * (R / outs)) }, 128, &a);
++    }
++
++    pub fn count(self: *const Down) usize {
++        return self.shape.rows * self.shape.k * R;
++    }
++
++    /// g[row][gate][n] = bf16(sum over 2W of pair * down[gate][n]), bf16 products exact in fp32.
++    pub fn solve(self: *const Down, a: std.mem.Allocator, s: Sums, out: []Iv) !void {
++        const gates = self.shape.k;
++        const terms = try a.alloc(Iv, P);
++        defer a.free(terms);
++        const scratch = try a.alloc(f64, P);
++        defer a.free(scratch);
++        for (0..self.shape.rows) |r| for (0..gates) |gi| for (0..R) |n| {
++            const x = self.pair[(r * gates + gi) * P ..][0..P];
++            const w = self.w.down[(gi * R + n) * P ..][0..P];
++            for (terms, x, w) |*t, u, v| t.* = Iv.of(ref.bf(u) * ref.bf(v));
++            out[(r * gates + gi) * R + n] = s.sum(terms, downDepth(self.shape), scratch).bf();
++        };
++    }
++};
++
++/// A lane's 8 index-ordered products, the 3 xor shuffles over an output's 8 lanes.
++fn blendDepth(_: c.Shape) usize {
++    return 8 + 3;
++}
++
++pub fn blendSpec(swapped: bool) c.Spec {
++    if (swapped) return .{ .name = "control: inkling2 loop tf_ink2_loop_blend with forget and gain swapped", .accum = .f32, .depth = blendDepth, .ops = 6, .out = .f32, .served = served[0..1] };
++    return .{ .name = "inkling2 loop tf_ink2_loop_blend ((1 - tanh(F g)) h + tanh(M g) msg)", .accum = .f32, .depth = blendDepth, .ops = 6, .out = .f32, .served = &served };
++}
++
++pub const Blend = struct {
++    kern: *const lp.Kernels,
++    swapped: bool = false,
++    shape: c.Shape = undefined,
++    h: []f32 = &.{},
++    msg: []f32 = &.{},
++    gv: []u16 = &.{},
++    w: Weights = .{},
++    in: [3]u64 = @splat(0),
++    out: u64 = 0,
++
++    pub const sums = {};
++
++    pub fn spec(self: *const Blend) c.Spec {
++        return blendSpec(self.swapped);
++    }
++
++    pub fn control(self: *const Blend) ?g.Gate {
++        return if (self.swapped) .shapes else null;
++    }
++
++    pub fn free(self: *Blend, a: std.mem.Allocator) void {
++        a.free(self.h);
++        a.free(self.msg);
++        a.free(self.gv);
++        self.h = &.{};
++        self.msg = &.{};
++        self.gv = &.{};
++        self.w.free(a);
++    }
++
++    /// h, msg in [-3, 3), g in [-2, 2); stress: g and weights mirrored a step apart (dots cancel through big sums).
++    pub fn prepare(self: *Blend, a: std.mem.Allocator, rig: *rig_.Rig, shape: c.Shape, fill: g.Fill, rng: std.Random) !bool {
++        if (shape.rows == 0 or shape.n != W or shape.k < 1 or shape.k > 3) return false;
++        self.free(a);
++        self.shape = shape;
++        const rows = shape.rows;
++        const n = rows * shape.k * W;
++        self.h = try ref.f32s(a, rng, n, -3, 3);
++        self.msg = try ref.f32s(a, rng, n, -3, 3);
++        self.gv = try ref.bfs(a, rng, rows * shape.k * R, -2, 2);
++        try self.w.make(a, rig, rng, shape.k);
++        if (fill == .stress) {
++            for (0..rows * shape.k) |o| for (0..R / 2) |k| {
++                const v = ref.int(rng, 1, 64);
++                self.gv[o * R + k] = c.toBf16(v);
++                self.gv[o * R + R / 2 + (k + 1) % (R / 2)] = c.toBf16(-v + @as(f32, if (k == 0) 1 else 0));
++            };
++            for ([_][]u16{ self.w.forget, self.w.gain }) |ws| for (0..shape.k * W) |col| for (0..R / 2) |k| {
++                const x = if (k == 0) ref.int(rng, 1, 2) else ref.int(rng, 1, 64);
++                ws[col * R + k] = c.toBf16(x);
++                ws[col * R + R / 2 + (k + 1) % (R / 2)] = c.toBf16(x);
++            };
++            try self.w.upload(rig, shape.k);
++        }
++        if (fill == .nonfinite) {
++            ref.plant(f32, self.h, @min(rows * shape.k, 4), W, ref.asF32);
++            if (rows * shape.k > 4) ref.plant(f32, self.msg[4 * W ..], @min(rows * shape.k - 4, 4), W, ref.asF32);
++        }
++        self.in = .{ try ref.input(rig, self.h), try ref.input(rig, self.msg), try ref.input(rig, self.gv) };
++        self.out = try rig.output(n * 4);
++        return true;
++    }
++
++    pub fn run(self: *Blend, rig: *rig_.Rig) !void {
++        const rows = self.shape.rows;
++        const gates = self.shape.k;
++        var w = self.w.dev;
++        if (self.swapped) std.mem.swap([4]u64, &w.forget, &w.gain);
++        const per: usize = if (rows <= 16) 16 else 32;
++        var a: cuda.Args = .{};
++        a.add(self.in[0]);
++        a.add(@as(i64, W));
++        a.add(@as(i64, if (gates == 1) 0 else @as(i64, @intCast(rows * W))));
++        a.add(self.in[1]);
++        a.add(self.in[2]);
++        a.add(w);
++        a.add(@as(i32, @intCast(rows)));
++        a.add(@as(i32, @intCast(gates)));
++        a.add(@as(i32, @intCast(per)));
++        a.add(self.out);
++        try launch(self.kern.blend, rig.s, .{ .x = W / 32, .y = @intCast(gates), .z = @intCast((rows + per - 1) / per) }, 256, &a);
++    }
++
++    pub fn count(self: *const Blend) usize {
++        return self.shape.rows * self.shape.k * W;
++    }
++
++    /// out = (1 - tanh(F g)) h + tanh(M g) msg; h [gates][rows][W], msg and out [rows][gates][W].
++    pub fn solve(self: *const Blend, _: std.mem.Allocator, s: Sums, out: []Iv) !void {
++        const rows = self.shape.rows;
++        const gates = self.shape.k;
++        var tf: [R]Iv = undefined;
++        var tm: [R]Iv = undefined;
++        var scratch: [R]f64 = undefined;
++        for (0..rows) |r| for (0..gates) |gi| for (0..W) |col| {
++            const gr = self.gv[(r * gates + gi) * R ..][0..R];
++            const fw = self.w.forget[(gi * W + col) * R ..][0..R];
++            const mw = self.w.gain[(gi * W + col) * R ..][0..R];
++            for (&tf, &tm, gr, fw, mw) |*a, *b, x, f, m| {
++                a.* = Iv.of(ref.bf(f) * ref.bf(x));
++                b.* = Iv.of(ref.bf(m) * ref.bf(x));
++            }
++            const fd = s.sum(&tf, blendDepth(self.shape), &scratch);
++            const md = s.sum(&tm, blendDepth(self.shape), &scratch);
++            const o = r * gates + gi;
++            const hv = Iv.of(self.h[(gi * rows + r) * W + col]);
++            const keep = Iv.of(1).sub(ref.tanh(fd));
++            out[o * W + col] = keep.mul(hv).add(ref.tanh(md).mul(Iv.of(self.msg[o * W + col])));
++        };
++    }
++};
+diff --git a/zig/tests/cuda/contract_inkling2_loop_ops.zig b/zig/tests/cuda/contract_inkling2_loop_ops.zig
+new file mode 100644
+index 000000000..783251890
+--- /dev/null
++++ b/zig/tests/cuda/contract_inkling2_loop_ops.zig
+@@ -0,0 +1,315 @@
++//! Mini's loop glue under the contract: tf_ink2_loop_mix (the raw mix), tf_ink2_loop_norm and tf_ink2_loop_bank.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const ref = @import("contract_inkling2_ops_ref.zig");
++const lp = @import("inkling2").loop;
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const Iv = ref.Iv;
++const Sums = ref.Sums;
++const W = lp.width;
++const max_blocks = 8;
++
++/// loop.zig's RawMix and Norms, field for field.
++const RawMix = extern struct { blocks: [max_blocks]u64 = @splat(0), partial: u64, query: u64, out: u64, n_blocks: i32, partial_bf16: i32, nq: i32, rows: i32, c: i32 };
++const Norms = extern struct { w: [3]u64 };
++
++fn launch(f: cuda.Function, s: cuda.Stream, grid: cuda.Dim3, threads: u32, a: *cuda.Args) !void {
++    try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = threads } }, s, a);
++}
++
++/// A row of 512 threads: each thread's strided chain, its warp's 5 shuffles and warp 0's 5 over the partials.
++fn rowDepth(_: c.Shape) usize {
++    return ref.blockDepth(W, 512);
++}
++
++/// A message visit's mix: attention's (q, k, v queries, bf16 partial) or the MLP's (one query, fp32 residual).
++pub const Form = enum { attn, mlp };
++
++/// Rows x hidden x blocks (completed + the partial); the control drops a completed block.
++pub fn mixSpec(f: Form, short: bool) c.Spec {
++    const served = &[_]c.Shape{ .{ .rows = 1, .n = W, .k = 5 }, .{ .rows = 16, .n = W, .k = 9 }, .{ .rows = 128, .n = W, .k = 3 }, .{ .rows = 37, .n = W, .k = 1 }, .{ .rows = 2048, .n = W, .k = 9 } };
++    const names = [2][]const u8{ "inkling2 loop tf_ink2_loop_mix attention (3 queries, bf16 partial, unnormed fp32)", "inkling2 loop tf_ink2_loop_mix MLP (1 query, fp32 residual, unnormed fp32)" };
++    var s: c.Spec = .{ .name = names[@backingInt(f)], .accum = .f32, .depth = rowDepth, .out = .f32, .served = served };
++    if (short) {
++        s.name = "control: inkling2 loop tf_ink2_loop_mix told one completed block fewer";
++        s.served = served[1..2];
++    }
++    return s;
++}
++
++pub const Mix = struct {
++    kern: *const lp.Kernels,
++    form: Form,
++    short: bool = false,
++    shape: c.Shape = undefined,
++    blocks: []u16 = &.{},
++    part: []f32 = &.{},
++    query: []f32 = &.{},
++    args: RawMix = undefined,
++
++    pub const sums = {};
++
++    pub fn spec(self: *const Mix) c.Spec {
++        return mixSpec(self.form, self.short);
++    }
++
++    pub fn control(self: *const Mix) ?g.Gate {
++        return if (self.short) .shapes else null;
++    }
++
++    pub fn free(self: *Mix, a: std.mem.Allocator) void {
++        a.free(self.blocks);
++        a.free(self.part);
++        a.free(self.query);
++        self.blocks = &.{};
++        self.part = &.{};
++        self.query = &.{};
++    }
++
++    fn nq(self: *const Mix) usize {
++        return if (self.form == .attn) 3 else 1;
++    }
++
++    /// Values in [-2, 2) with one in 61 eight times larger, queries in [-1, 1); stress: integers in [-48, 48].
++    pub fn prepare(self: *Mix, a: std.mem.Allocator, rig: *rig_.Rig, shape: c.Shape, fill: g.Fill, rng: std.Random) !bool {
++        if (shape.rows == 0 or shape.n != W or shape.k < 1 or shape.k > max_blocks + 1) return false;
++        self.free(a);
++        self.shape = shape;
++        const rows = shape.rows;
++        const nb = shape.k - 1;
++        const stress = fill == .stress;
++        const bfp = self.form == .attn;
++        self.blocks = try a.alloc(u16, nb * rows * W);
++        for (self.blocks, 0..) |*v, i| v.* = c.toBf16(if (stress) ref.int(rng, -48, 48) else (rng.float(f32) * 4 - 2) * (if (i % 61 == 5) @as(f32, 8) else 1));
++        self.part = try a.alloc(f32, rows * W);
++        for (self.part, 0..) |*v, i| {
++            v.* = if (stress) ref.int(rng, -48, 48) else (rng.float(f32) * 4 - 2) * (if (i % 53 == 1) @as(f32, 8) else 1);
++            if (bfp) v.* = c.fromBf16(c.toBf16(v.*));
++        }
++        self.query = try a.alloc(f32, self.nq() * W);
++        for (self.query) |*v| v.* = if (stress) ref.int(rng, -4, 4) else rng.float(f32) * 2 - 1;
++        if (fill == .nonfinite) {
++            if (nb > 0) ref.plant(u16, self.blocks[(nb - 1) * rows * W ..][0 .. rows * W], 1, W, ref.asBf);
++            if (nb == 0) ref.plant(f32, self.part, 1, W, ref.asF32);
++            if (rows > 1) ref.plant(f32, self.part[W..], @min(rows - 1, 3), W, ref.asF32);
++        }
++        var m: RawMix = .{ .partial = 0, .query = 0, .out = 0, .n_blocks = @intCast(nb), .partial_bf16 = @intFromBool(bfp), .nq = @intCast(self.nq()), .rows = @intCast(rows), .c = W };
++        for (0..nb) |j| m.blocks[j] = try ref.input(rig, self.blocks[j * rows * W ..][0 .. rows * W]);
++        if (bfp) {
++            const h = try a.alloc(u16, rows * W);
++            defer a.free(h);
++            for (h, self.part) |*d, v| d.* = c.toBf16(v);
++            m.partial = try ref.input(rig, h);
++        } else m.partial = try ref.input(rig, self.part);
++        m.query = try ref.input(rig, self.query);
++        m.out = try rig.output(self.count() * 4);
++        self.args = m;
++        return true;
++    }
++
++    pub fn run(self: *Mix, rig: *rig_.Rig) !void {
++        var m = self.args;
++        if (self.short) m.n_blocks -= 1;
++        var a: cuda.Args = .{};
++        a.add(m);
++        try launch(self.kern.mix, rig.s, .{ .x = @intCast(m.rows) }, 512, &a);
++    }
++
++    pub fn count(self: *const Mix) usize {
++        return self.nq() * self.shape.rows * W;
++    }
++
++    fn at(self: *const Mix, j: usize, r: usize, col: usize) f64 {
++        const nb = self.shape.k - 1;
++        return if (j < nb) ref.bf(self.blocks[(j * self.shape.rows + r) * W + col]) else self.part[r * W + col];
++    }
++
++    /// tf_ink2_mix_rows' sums: each block's RMS and query dots, a softmax a query, the weighted sum, left in fp32.
++    pub fn solve(self: *const Mix, a: std.mem.Allocator, s: Sums, out: []Iv) !void {
++        const rows = self.shape.rows;
++        const n = self.shape.k;
++        const q = self.nq();
++        const terms = try a.alloc(Iv, W);
++        defer a.free(terms);
++        const scratch = try a.alloc(f64, W);
++        defer a.free(scratch);
++        const d = rowDepth(self.shape);
++        const root = Iv.of(W).rsqrt();
++        for (0..rows) |r| {
++            var rr: [max_blocks + 1]Iv = undefined;
++            var w: [3][max_blocks + 1]Iv = undefined;
++            for (0..n) |j| {
++                for (terms, 0..) |*t, col| t.* = Iv.of(self.at(j, r, col)).mul(Iv.of(self.at(j, r, col)));
++                rr[j] = ref.rms(s.sum(terms, d, scratch), W, 1e-6);
++                for (0..q) |qi| {
++                    for (terms, 0..) |*t, col| t.* = Iv.of(self.at(j, r, col)).mul(Iv.of(self.query[qi * W + col]));
++                    w[qi][j] = s.sum(terms, d, scratch).mul(rr[j]).mul(root);
++                }
++            }
++            for (0..q) |qi| softmax(w[qi][0..n]);
++            for (0..q) |qi| for (out[(qi * rows + r) * W ..][0..W], 0..) |*o, col| {
++                var acc = Iv.of(0);
++                for (0..n) |j| acc = acc.add(w[qi][j].mul(Iv.of(self.at(j, r, col)).mul(rr[j])));
++                o.* = acc;
++            };
++        }
++    }
++};
++
++/// The kernel's softmax over a query's block logits: fmaxf's maximum, expf of each less it, a sum in order, a division.
++fn softmax(l: []Iv) void {
++    var m = l[0];
++    for (l[1..]) |v| m = .{ .m = @max(m.m, v.m), .lo = @max(m.lo, v.lo), .hi = @max(m.hi, v.hi) };
++    var e: [max_blocks + 1]Iv = undefined;
++    var t = Iv.of(0);
++    for (l, 0..) |v, j| {
++        e[j] = v.sub(m).exp();
++        t = t.add(e[j]);
++    }
++    for (l, 0..) |*v, j| v.* = e[j].div(t);
++}
++
++/// Rows x hidden x gates; the control norms every gate with gate 0's weight.
++pub fn normSpec(one: bool) c.Spec {
++    const served = &[_]c.Shape{ .{ .rows = 1, .n = W, .k = 3 }, .{ .rows = 16, .n = W, .k = 1 }, .{ .rows = 128, .n = W, .k = 3 }, .{ .rows = 37, .n = W, .k = 1 }, .{ .rows = 2048, .n = W, .k = 1 } };
++    if (one) return .{ .name = "control: inkling2 loop tf_ink2_loop_norm with gate 0's weight on every gate", .accum = .f32, .depth = rowDepth, .out = .bf16, .served = served[0..1] };
++    return .{ .name = "inkling2 loop tf_ink2_loop_norm (each gate's output normed into bf16 [gates][rows])", .accum = .f32, .depth = rowDepth, .out = .bf16, .served = served };
++}
++
++pub const Norm = struct {
++    kern: *const lp.Kernels,
++    one: bool = false,
++    shape: c.Shape = undefined,
++    x: []f32 = &.{},
++    w: []u16 = &.{},
++    in: [4]u64 = @splat(0),
++    out: u64 = 0,
++
++    pub const sums = {};
++
++    pub fn spec(self: *const Norm) c.Spec {
++        return normSpec(self.one);
++    }
++
++    pub fn control(self: *const Norm) ?g.Gate {
++        return if (self.one) .shapes else null;
++    }
++
++    pub fn free(self: *Norm, a: std.mem.Allocator) void {
++        a.free(self.x);
++        a.free(self.w);
++        self.x = &.{};
++        self.w = &.{};
++    }
++
++    /// x in [-3, 3) with one in 47 ten times larger, weights in [0.5, 1.5); stress: integers in [-48, 48].
++    pub fn prepare(self: *Norm, a: std.mem.Allocator, rig: *rig_.Rig, shape: c.Shape, fill: g.Fill, rng: std.Random) !bool {
++        if (shape.rows == 0 or shape.n != W or shape.k < 1 or shape.k > 3) return false;
++        self.free(a);
++        self.shape = shape;
++        const n = shape.rows * shape.k * W;
++        self.x = try a.alloc(f32, n);
++        for (self.x, 0..) |*v, i| v.* = if (fill == .stress) ref.int(rng, -48, 48) else (rng.float(f32) * 6 - 3) * (if (i % 47 == 3) @as(f32, 10) else 1);
++        self.w = try ref.bfs(a, rng, shape.k * W, 0.5, 1.5);
++        if (fill == .nonfinite) ref.plant(f32, self.x, @min(shape.rows * shape.k, 4), W, ref.asF32);
++        self.in[0] = try ref.input(rig, self.x);
++        for (0..shape.k) |j| self.in[1 + j] = try ref.input(rig, self.w[j * W ..][0..W]);
++        self.out = try rig.output(n * 2);
++        return true;
++    }
++
++    pub fn run(self: *Norm, rig: *rig_.Rig) !void {
++        var w: Norms = .{ .w = .{ self.in[1], self.in[2], self.in[3] } };
++        if (self.one) w.w = @splat(self.in[1]);
++        var a: cuda.Args = .{};
++        a.add(self.in[0]);
++        a.add(w);
++        a.add(self.out);
++        a.add(@as(i32, @intCast(self.shape.rows)));
++        a.add(@as(i32, W));
++        a.add(ref.eps);
++        try launch(self.kern.norm, rig.s, .{ .x = @intCast(self.shape.rows), .y = @intCast(self.shape.k) }, 512, &a);
++    }
++
++    pub fn count(self: *const Norm) usize {
++        return self.shape.rows * self.shape.k * W;
++    }
++
++    /// out[gate][row] = bf16(w * (x * rsqrtf(sum x^2 / C + eps))).
++    pub fn solve(self: *const Norm, a: std.mem.Allocator, s: Sums, out: []Iv) !void {
++        const rows = self.shape.rows;
++        const gates = self.shape.k;
++        const terms = try a.alloc(Iv, W);
++        defer a.free(terms);
++        const scratch = try a.alloc(f64, W);
++        defer a.free(scratch);
++        for (0..rows) |r| for (0..gates) |gi| {
++            const x = self.x[(r * gates + gi) * W ..][0..W];
++            for (terms, x) |*t, v| t.* = Iv.of(v).mul(Iv.of(v));
++            const rq = ref.rms(s.sum(terms, rowDepth(self.shape), scratch), W, ref.eps);
++            for (out[(gi * rows + r) * W ..][0..W], x, self.w[gi * W ..][0..W]) |*o, v, nw| o.* = Iv.of(ref.bf(nw)).mul(Iv.of(v).mul(rq)).bf();
++        };
++    }
++};
++
++/// Rows x hidden x sources (2, Mini's): every source written by its own launch; the control swaps the sources.
++pub fn bankSpec(wrong: bool) c.Spec {
++    const served = &[_]c.Shape{ .{ .rows = 1, .n = W, .k = 2 }, .{ .rows = 16, .n = W, .k = 2 }, .{ .rows = 2048, .n = W, .k = 2 } };
++    if (wrong) return .{ .name = "control: inkling2 loop tf_ink2_loop_bank with the sources swapped", .accum = .none, .depth = ref.noSums, .out = .f32, .served = served[0..1] };
++    return .{ .name = "inkling2 loop tf_ink2_loop_bank (bf16 rows into an fp32 bank source, exact)", .accum = .none, .depth = ref.noSums, .out = .f32, .served = served };
++}
++
++pub const Bank = struct {
++    kern: *const lp.Kernels,
++    wrong: bool = false,
++    shape: c.Shape = undefined,
++    x: []u16 = &.{},
++    in: u64 = 0,
++    out: u64 = 0,
++
++    pub fn spec(self: *const Bank) c.Spec {
++        return bankSpec(self.wrong);
++    }
++
++    pub fn control(self: *const Bank) ?g.Gate {
++        return if (self.wrong) .shapes else null;
++    }
++
++    pub fn free(self: *Bank, a: std.mem.Allocator) void {
++        a.free(self.x);
++        self.x = &.{};
++    }
++
++    /// x bf16 in [-4, 4) per source ([sources][rows][C]); non-finite: NaN and infinities planted.
++    pub fn prepare(self: *Bank, a: std.mem.Allocator, rig: *rig_.Rig, shape: c.Shape, fill: g.Fill, rng: std.Random) !bool {
++        if (shape.rows == 0 or shape.n != W or shape.k < 1 or shape.k > 4) return false;
++        self.free(a);
++        self.shape = shape;
++        self.x = try ref.bfs(a, rng, shape.k * shape.rows * W, -4, 4);
++        if (fill == .nonfinite) ref.plant(u16, self.x, @min(shape.rows, 4), W, ref.asBf);
++        self.in = try ref.input(rig, self.x);
++        self.out = try rig.output(self.count() * 4);
++        return true;
++    }
++
++    pub fn run(self: *Bank, rig: *rig_.Rig) !void {
++        const n = self.shape.rows * W;
++        for (0..self.shape.k) |src| try lp.save(self.kern, rig.s, self.in + src * n * 2, self.out, self.shape.k, if (self.wrong) self.shape.k - 1 - src else src, self.shape.rows);
++    }
++
++    pub fn count(self: *const Bank) usize {
++        return self.shape.rows * self.shape.k * W;
++    }
++
++    pub fn solve(self: *const Bank, _: std.mem.Allocator, _: Sums, out: []Iv) !void {
++        const rows = self.shape.rows;
++        const k = self.shape.k;
++        for (0..rows) |r| for (0..k) |src| for (0..W) |col| {
++            out[(r * k + src) * W + col] = Iv.of(ref.bf(self.x[(src * rows + r) * W + col]));
++        };
++    }
++};
+-- 
+2.53.0
+

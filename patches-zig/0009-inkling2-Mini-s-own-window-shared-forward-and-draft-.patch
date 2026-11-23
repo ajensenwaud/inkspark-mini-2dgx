@@ -1,0 +1,61 @@
+From 3d2b6a7816d38095484de9b768d71296a15c98c1 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:01:24 +1100
+Subject: [PATCH 09/24] inkling2: Mini's own window, shared-forward and
+ draft-pass costs for the depth rule
+
+Timed on pack A at two ranks (tf-inkling2-engine timing, graphed, medians of 16): one row 17.9 ms, eight 33.2 ms,
+the draft pass 7.8 ms a stream. Small keeps its tables.
+---
+ zig/src/families/inkling2/lanes.zig | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 270466711..55c6b7467 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -24,6 +24,15 @@ const gb10_shared_costs = [_]lanes.config.Cost{
+     .{ .width = 8, .ms = 81.4 },   .{ .width = 16, .ms = 120.6 }, .{ .width = 32, .ms = 182.3 },
+     .{ .width = 64, .ms = 223.4 },
+ };
++/// Mini's (pack A, 4.05 bpw) lone windows and shared forwards, timed the same way; its draft pass 7.8 ms a stream.
++const mini_window_costs = [_]lanes.config.Cost{
++    .{ .width = 1, .ms = 17.9 }, .{ .width = 2, .ms = 21.7 }, .{ .width = 3, .ms = 24.2 }, .{ .width = 4, .ms = 26.7 },
++    .{ .width = 5, .ms = 28.6 }, .{ .width = 6, .ms = 30.3 }, .{ .width = 7, .ms = 31.8 }, .{ .width = 8, .ms = 33.2 },
++};
++const mini_shared_costs = [_]lanes.config.Cost{
++    .{ .width = 1, .ms = 17.9 },  .{ .width = 2, .ms = 21.7 },  .{ .width = 4, .ms = 28.7 },  .{ .width = 8, .ms = 36.8 },
++    .{ .width = 16, .ms = 48.1 }, .{ .width = 32, .ms = 66.2 }, .{ .width = 64, .ms = 88.0 },
++};
+ 
+ /// A stream's place in the backend: its slot, the rows its last window left uncommitted, its first token.
+ const Lane = struct {
+@@ -72,6 +81,7 @@ pub const Lanes = struct {
+     /// Round facts: DSpark's blocks when the pack holds the drafter, several streams' rows in one shared forward.
+     pub fn facts(self: *const Lanes) lanes.Model {
+         const head = self.x.e.drafter != null;
++        const mini = self.x.e.c.loop != null;
+         return .{
+             .copy_drafts = false,
+             .exact_width = max_rows,
+@@ -81,13 +91,13 @@ pub const Lanes = struct {
+             .speculate_early = false,
+             .drafts = if (head) max_held else 0,
+             .draft_streams = head,
+-            .mtp_step_ms = if (head) 16.4 / @as(f64, max_held) else 0, // a block's 7 drafts in one pass (16.4 ms timed)
+-            .draft_step_ms = if (head) 15.9 else 0, // a shared round's block pass, a stream at a time (127.1 ms for 8)
++            .mtp_step_ms = if (head) @as(f64, if (mini) 7.8 else 16.4) / max_held else 0, // a block's 7 drafts in one pass
++            .draft_step_ms = if (head) (if (mini) 7.5 else 15.9) else 0, // a shared round's block pass, a stream at a time
+             .plain_streams = if (head) 2 else 0, // passes run a stream at a time: shared rounds draft none
+             .plain_guard = head, // plain rounds compete: one-row forwards are cheap next to a draft pass
+-            .window_costs = if (head) &gb10_window_costs else &.{},
++            .window_costs = if (!head) &.{} else if (mini) &mini_window_costs else &gb10_window_costs,
+             .window_costs_lone = true,
+-            .shared_costs = if (head) &gb10_shared_costs else &.{},
++            .shared_costs = if (!head) &.{} else if (mini) &mini_shared_costs else &gb10_shared_costs,
+             .hidden_rows = true,
+             .batch_rows = engine.shared_rows,
+             .max_streams = engine.max_shared,
+-- 
+2.53.0
+

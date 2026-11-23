@@ -1,0 +1,95 @@
+From c872ee252108eee1b3f3ce9bf3f599a6f0f7f8a5 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 16:43:10 +1100
+Subject: [PATCH 12/24] inkling2: compile records for Mini's loop kernels
+
+The ten launches of the inkling2_loop image (loop.cu: message, the three
+gate down projections, blend, mix, norm, bank, and the prompt GEMM's
+rotation and epilogue) get nvcc 13.0 records on the five SMs, with
+later_pending set; nvcc 13.3's receipts go in measurements/pending_133.zig
+and 13.2 stays pending. The image joins the contract runner's image list.
+---
+ .../core/contract/inkling2_cuda_records.zig   |  7 ++++---
+ .../core/contract/inkling2_loop_records.zig   | 20 +++++++++++++++++++
+ .../contract/measurements/pending_133.zig     | 10 ++++++++++
+ zig/tests/cuda/contract_limits.zig            |  2 +-
+ 4 files changed, 35 insertions(+), 4 deletions(-)
+ create mode 100644 zig/src/core/contract/inkling2_loop_records.zig
+
+diff --git a/zig/src/core/contract/inkling2_cuda_records.zig b/zig/src/core/contract/inkling2_cuda_records.zig
+index 94426f828..f30f0b61d 100644
+--- a/zig/src/core/contract/inkling2_cuda_records.zig
++++ b/zig/src/core/contract/inkling2_cuda_records.zig
+@@ -3,7 +3,8 @@ const attn = @import("inkling2_attn_records.zig");
+ const ops = @import("inkling2_ops_records.zig");
+ const dspark = @import("inkling2_dspark_records.zig");
+ const experts = @import("inkling2_experts_records.zig");
++const loop = @import("inkling2_loop_records.zig");
+ 
+-pub const cuda = attn.cuda ++ ops.cuda ++ dspark.cuda ++ experts.cuda;
+-pub const cuda_132 = attn.cuda_132 ++ ops.cuda_132 ++ dspark.cuda_132 ++ experts.cuda_132;
+-pub const cuda_133 = attn.cuda_133 ++ ops.cuda_133 ++ dspark.cuda_133 ++ experts.cuda_133;
++pub const cuda = attn.cuda ++ ops.cuda ++ dspark.cuda ++ experts.cuda ++ loop.cuda;
++pub const cuda_132 = attn.cuda_132 ++ ops.cuda_132 ++ dspark.cuda_132 ++ experts.cuda_132 ++ loop.cuda_132;
++pub const cuda_133 = attn.cuda_133 ++ ops.cuda_133 ++ dspark.cuda_133 ++ experts.cuda_133 ++ loop.cuda_133;
+diff --git a/zig/src/core/contract/inkling2_loop_records.zig b/zig/src/core/contract/inkling2_loop_records.zig
+new file mode 100644
+index 000000000..0da7f3515
+--- /dev/null
++++ b/zig/src/core/contract/inkling2_loop_records.zig
+@@ -0,0 +1,20 @@
++//! Inkling 2 Mini's inkling2_loop image (loop.cu): every SM's compile records (nvcc 13.0; 13.2 pending).
++const registry = @import("registry.zig");
++
++/// nvcc 13.0's usage (nvcc -cubin per SM at the image's flags); 13.2 pending, 13.3 in measurements/pending_133.zig.
++pub const cuda = [_]registry.CudaRecord{
++    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_msg", .symbol = "tf_ink2_loop_msg", .image = "inkling2_loop", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 73, .static = 160, .bound = 256 }, .{ .regs = 80, .static = 160, .bound = 256 }, .{ .regs = 80, .static = 160, .bound = 256 }, .{ .regs = 89, .static = 160, .bound = 256 }, .{ .regs = 89, .static = 160, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_down8", .symbol = "tf_ink2_loop_down8", .image = "inkling2_loop", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 40, .static = 2052, .bound = 128 }, .{ .regs = 50, .static = 2052, .bound = 128 }, .{ .regs = 50, .static = 2052, .bound = 128 }, .{ .regs = 44, .static = 2052, .bound = 128 }, .{ .regs = 44, .static = 2052, .bound = 128 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_down16", .symbol = "tf_ink2_loop_down16", .image = "inkling2_loop", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 46, .static = 4100, .bound = 128 }, .{ .regs = 44, .static = 4100, .bound = 128 }, .{ .regs = 44, .static = 4100, .bound = 128 }, .{ .regs = 48, .static = 4100, .bound = 128 }, .{ .regs = 48, .static = 4100, .bound = 128 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_down64", .symbol = "tf_ink2_loop_down64", .image = "inkling2_loop", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 78, .static = 16388, .bound = 128 }, .{ .regs = 98, .static = 16388, .bound = 128 }, .{ .regs = 98, .static = 16388, .bound = 128 }, .{ .regs = 96, .static = 16388, .bound = 128 }, .{ .regs = 96, .static = 16388, .bound = 128 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_blend", .symbol = "tf_ink2_loop_blend", .image = "inkling2_loop", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 39, .static = 8192, .bound = 256 }, .{ .regs = 40, .static = 8192, .bound = 256 }, .{ .regs = 40, .static = 8192, .bound = 256 }, .{ .regs = 40, .static = 8192, .bound = 256 }, .{ .regs = 40, .static = 8192, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_mix", .symbol = "tf_ink2_loop_mix", .image = "inkling2_loop", .threads = 512, .min_sm = 80 }, .usage = .{ .{ .regs = 32, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_norm", .symbol = "tf_ink2_loop_norm", .image = "inkling2_loop", .threads = 512, .min_sm = 80 }, .usage = .{ .{ .regs = 17, .static = 128, .bound = 512 }, .{ .regs = 18, .static = 128, .bound = 512 }, .{ .regs = 18, .static = 128, .bound = 512 }, .{ .regs = 22, .static = 128, .bound = 512 }, .{ .regs = 22, .static = 128, .bound = 512 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_bank", .symbol = "tf_ink2_loop_bank", .image = "inkling2_loop", .threads = 256, .min_sm = 80 }, .usage = .{ .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_rotate", .symbol = "tf_ink2_loop_rotate", .image = "inkling2_loop", .threads = 32, .min_sm = 80 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 28, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 } }, .later_pending = true },
++    .{ .launch = .{ .name = "inkling2 loop tf_ink2_loop_tail", .symbol = "tf_ink2_loop_tail", .image = "inkling2_loop", .threads = 32, .min_sm = 80 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 30, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 24, .static = 0, .bound = 32 }, .{ .regs = 24, .static = 0, .bound = 32 } }, .later_pending = true },
++};
++/// nvcc 13.2's: pending (no 13.2 compiler measured).
++pub const cuda_132 = [_]registry.Override{};
++/// nvcc 13.3's: none here, as later_pending reads 13.3 from measurements/pending_133.zig (all ten launches).
++pub const cuda_133 = [_]registry.Override{};
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index ba09ea61e..16c9ceec2 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -75,4 +75,14 @@ pub const records = [_]Override{
+     .{ .name = "mla tf_mla_rope", .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 22, .static = 0, .bound = 32 }, .{ .regs = 22, .static = 0, .bound = 32 } } },
+     .{ .name = "mla tf_mla_gate", .usage = .{ .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 16, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 }, .{ .regs = 12, .static = 0, .bound = 0 } } },
+     .{ .name = "exl3_experts tf_exl3_plan_finish_after", .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
++    .{ .name = "inkling2 loop tf_ink2_loop_msg", .usage = .{ .{ .regs = 73, .static = 160, .bound = 256 }, .{ .regs = 80, .static = 160, .bound = 256 }, .{ .regs = 80, .static = 160, .bound = 256 }, .{ .regs = 83, .static = 160, .bound = 256 }, .{ .regs = 83, .static = 160, .bound = 256 } } },
++    .{ .name = "inkling2 loop tf_ink2_loop_down8", .usage = .{ .{ .regs = 40, .static = 2052, .bound = 128 }, .{ .regs = 50, .static = 2052, .bound = 128 }, .{ .regs = 50, .static = 2052, .bound = 128 }, .{ .regs = 44, .static = 2052, .bound = 128 }, .{ .regs = 44, .static = 2052, .bound = 128 } } },
++    .{ .name = "inkling2 loop tf_ink2_loop_down16", .usage = .{ .{ .regs = 46, .static = 4100, .bound = 128 }, .{ .regs = 44, .static = 4100, .bound = 128 }, .{ .regs = 44, .static = 4100, .bound = 128 }, .{ .regs = 48, .static = 4100, .bound = 128 }, .{ .regs = 48, .static = 4100, .bound = 128 } } },
++    .{ .name = "inkling2 loop tf_ink2_loop_down64", .usage = .{ .{ .regs = 78, .static = 16388, .bound = 128 }, .{ .regs = 98, .static = 16388, .bound = 128 }, .{ .regs = 98, .static = 16388, .bound = 128 }, .{ .regs = 100, .static = 16388, .bound = 128 }, .{ .regs = 100, .static = 16388, .bound = 128 } } },
++    .{ .name = "inkling2 loop tf_ink2_loop_blend", .usage = .{ .{ .regs = 39, .static = 8192, .bound = 256 }, .{ .regs = 40, .static = 8192, .bound = 256 }, .{ .regs = 40, .static = 8192, .bound = 256 }, .{ .regs = 40, .static = 8192, .bound = 256 }, .{ .regs = 40, .static = 8192, .bound = 256 } } },
++    .{ .name = "inkling2 loop tf_ink2_loop_mix", .usage = .{ .{ .regs = 32, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 }, .{ .regs = 40, .static = 272, .bound = 512 } } },
++    .{ .name = "inkling2 loop tf_ink2_loop_norm", .usage = .{ .{ .regs = 17, .static = 128, .bound = 512 }, .{ .regs = 18, .static = 128, .bound = 512 }, .{ .regs = 18, .static = 128, .bound = 512 }, .{ .regs = 20, .static = 128, .bound = 512 }, .{ .regs = 20, .static = 128, .bound = 512 } } },
++    .{ .name = "inkling2 loop tf_ink2_loop_bank", .usage = .{ .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 } } },
++    .{ .name = "inkling2 loop tf_ink2_loop_rotate", .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 28, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 } } },
++    .{ .name = "inkling2 loop tf_ink2_loop_tail", .usage = .{ .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 30, .static = 0, .bound = 32 }, .{ .regs = 26, .static = 0, .bound = 32 }, .{ .regs = 23, .static = 0, .bound = 32 }, .{ .regs = 23, .static = 0, .bound = 32 } } },
+ };
+diff --git a/zig/tests/cuda/contract_limits.zig b/zig/tests/cuda/contract_limits.zig
+index 6aab1df41..0123221ae 100644
+--- a/zig/tests/cuda/contract_limits.zig
++++ b/zig/tests/cuda/contract_limits.zig
+@@ -32,7 +32,7 @@ pub fn image(name: []const u8) error{UnknownContractImage}![]const u8 {
+     inline for (.{ "qwen4_projection", "qwen4_hc", "qwen4_gdn", "qwen4_ple", "gemma4_ple" }) |n|
+         if (std.mem.eql(u8, name, n)) return @field(kk, n);
+     inline for (.{ "tree_round", "act_rows", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "qmm_prefill", "lane_gemv", "prompt16", "qmmf", "ck_experts", "nvfp4_experts", "nvfp4_experts_tile", "nvfp4_experts32", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "glm_ops", "glm_index", "nemotron_mamba", "sample", "qwen35", "qwen35_bf16_rows", "qwen35_keep", "qwen35_kv8", "w4a8_prefill", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "window_pages", "moe_glue", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows", "nemotron_ops", "minimax_m3", "minimax_m3_attn", "experts_bf16", "nemo_audio", "moss_image", "idol", "idol_decoder", "lfm2_moe", "lfm2", "dots_mocr", "muse_glue", "muse_attention", "muse_linear", "muse_experts2", "muse_dflash", "muse_dflash2" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+-    inline for (.{ "inkling2_attn", "inkling2_pattn", "inkling2_ops", "inkling2_rows", "inkling2_experts", "inkling2_vision", "inkling2_dspark" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
++    inline for (.{ "inkling2_attn", "inkling2_pattn", "inkling2_ops", "inkling2_rows", "inkling2_experts", "inkling2_vision", "inkling2_dspark", "inkling2_loop" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+     inline for (.{ "moss_image_decoder", "moss_image_encoder" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+     if (std.mem.eql(u8, name, "contract_controls")) return if (options.controls) &controls.bytes else &.{};
+     return error.UnknownContractImage;
+-- 
+2.53.0
+

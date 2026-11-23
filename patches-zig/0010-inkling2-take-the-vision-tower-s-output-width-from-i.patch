@@ -1,0 +1,229 @@
+From a232b5f2d7fb2ba38d12f305249d77ae1576129e Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 14:21:36 +1100
+Subject: [PATCH 10/24] inkling2: take the vision tower's output width from its
+ projector
+
+Small's projector writes 4,608-wide rows and Mini's 2,304. The tower reads the width from proj_out's rows,
+the engine's image rows, broadcasts and splices use the decoder's hidden size, and a tower whose width differs
+from it is refused at load.
+---
+ zig/src/families/inkling2/engine.zig      |  9 +++++----
+ zig/src/families/inkling2/forward.zig     |  2 +-
+ zig/src/families/inkling2/pictures.zig    | 10 +++++-----
+ zig/src/families/inkling2/vision.zig      | 12 +++++++-----
+ zig/src/families/inkling2/vision_main.zig | 14 +++++++-------
+ 5 files changed, 25 insertions(+), 22 deletions(-)
+
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 65e0cb018..0fc42d89b 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -123,6 +123,7 @@ pub const Engine = struct {
+         e.vision = o.vision;
+         if (o.vision != null and rank == 0) e.tower = try vision.Tower.load(gpa, io, d, dir, pictures.picture_tokens);
+         errdefer if (e.tower) |t| t.deinit();
++        if (e.tower) |t| if (t.hidden != e.c.hidden) return error.VisionWidth; // the tower's rows replace embeddings
+         e.picks = try cuda.DeviceBuffer.alloc(d, world * pickStride(shared_rows));
+         errdefer e.picks.free();
+         e.picks_host = try gpa.alloc(u8, world * pickStride(shared_rows));
+@@ -166,7 +167,7 @@ pub const Engine = struct {
+     /// Bytes one more stream takes on this rank: its slot's rings and conv states, their backup, its drafter caches.
+     pub fn seqBytes(e: *const Engine) u64 {
+         const draft: u64 = if (e.drafter) |dr| drun.slotBytes(&dr.w.c, e.shape_d.kv, e.capacity, e.c.hidden) else 0;
+-        const rows: u64 = if (e.vision) |l| pictures.slotBytes(l) else 0;
++        const rows: u64 = if (e.vision) |l| pictures.slotBytes(l, e.c.hidden) else 0;
+         return fw.slotBytes(&e.c, e.shape_d) + e.convBytes() + draft + rows;
+     }
+ 
+@@ -221,7 +222,7 @@ pub const Engine = struct {
+             e.sites.?.free();
+             e.sites = null;
+         }
+-        if (e.vision) |l| e.rows = try pictures.makeRows(e.gpa, e.d, l, slots);
++        if (e.vision) |l| e.rows = try pictures.makeRows(e.gpa, e.d, l, slots, e.c.hidden);
+         e.seqs = try e.gpa.alloc(Seq, slots);
+         @memset(e.seqs, .{});
+         if (e.drafter) |dr| {
+@@ -265,11 +266,11 @@ pub const Engine = struct {
+         if (e.tower) |t| {
+             const ps = pics orelse return error.ImagePlaceholders;
+             if (ps.len != spans.len) return error.ImagePlaceholders;
+-            for (ps, spans) |p, sp| try t.encode(e.stream, p, r.buf.ptr + @as(u64, sp.row) * vision.hidden * 2);
++            for (ps, spans) |p, sp| try t.encode(e.stream, p, r.buf.ptr + @as(u64, sp.row) * e.c.hidden * 2);
+         } else if (e.exchange == .local) return error.NoVision;
+         switch (e.exchange) {
+             .local => {},
+-            .nccl => |x| try x.lib.check(x.lib.api.ncclBroadcast(r.buf.ptr, r.buf.ptr, @as(usize, total) * vision.hidden * 2, .u8, 0, x.comm, e.stream.handle), "ncclBroadcast"),
++            .nccl => |x| try x.lib.check(x.lib.api.ncclBroadcast(r.buf.ptr, r.buf.ptr, @as(usize, total) * e.c.hidden * 2, .u8, 0, x.comm, e.stream.handle), "ncclBroadcast"),
+         }
+         try r.spans.appendSlice(e.gpa, spans);
+     }
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 37e55acbc..c17e08d5d 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -405,7 +405,7 @@ pub const Forward = struct {
+         const conv_segs = base + lay.conv;
+         const streams = p.ni;
+         try ops.embed(k, s, base, n, f.w.embed, f.w.embed_norm, b.x, h, c.eps);
+-        if (f.images) |im| try vision.splice(f.d, s, im.rows, im.spans, im.lo, im.lo + n, b.x);
++        if (f.images) |im| try vision.splice(f.d, s, im.rows, im.spans, im.lo, im.lo + n, b.x, h);
+         var nb: usize = 0;
+         const hd: usize = c.head_dim;
+         const kvw = f.shape.kv * hd;
+diff --git a/zig/src/families/inkling2/pictures.zig b/zig/src/families/inkling2/pictures.zig
+index a36efb12c..053db3877 100644
+--- a/zig/src/families/inkling2/pictures.zig
++++ b/zig/src/families/inkling2/pictures.zig
+@@ -65,12 +65,12 @@ pub const Rows = struct {
+ };
+ 
+ /// Bytes a slot's image rows take at a request's limit.
+-pub fn slotBytes(l: Limits) u64 {
+-    return @as(u64, l.image_tokens) * vision.hidden * 2;
++pub fn slotBytes(l: Limits, hidden: usize) u64 {
++    return @as(u64, l.image_tokens) * hidden * 2;
+ }
+ 
+ /// Every slot's rows buffer, made with the slots.
+-pub fn makeRows(gpa: std.mem.Allocator, d: *const cuda.Driver, l: Limits, slots: usize) ![]Rows {
++pub fn makeRows(gpa: std.mem.Allocator, d: *const cuda.Driver, l: Limits, slots: usize, hidden: usize) ![]Rows {
+     const rows = try gpa.alloc(Rows, slots);
+     var made: usize = 0;
+     errdefer {
+@@ -78,7 +78,7 @@ pub fn makeRows(gpa: std.mem.Allocator, d: *const cuda.Driver, l: Limits, slots:
+         gpa.free(rows);
+     }
+     for (rows) |*r| {
+-        r.* = .{ .buf = try cuda.DeviceBuffer.alloc(d, slotBytes(l)) };
++        r.* = .{ .buf = try cuda.DeviceBuffer.alloc(d, slotBytes(l, hidden)) };
+         made += 1;
+     }
+     return rows;
+@@ -167,6 +167,6 @@ test "the cap: a picture past 4096 tokens is refused with words naming the limit
+     try std.testing.expect(image.tokensFor(2560, 2560) == picture_tokens);
+     try std.testing.expect(image.tokensFor(2561, 2560) > picture_tokens);
+     try std.testing.expect(std.mem.indexOf(u8, Offer.explain(error.ImageTooLarge).?, "4096") != null);
+-    try std.testing.expectEqual(@as(u64, 4096 * 4608 * 2), slotBytes(.{ .image_tokens = default_image_tokens, .max_images = 4 }));
++    try std.testing.expectEqual(@as(u64, 4096 * 4608 * 2), slotBytes(.{ .image_tokens = default_image_tokens, .max_images = 4 }, 4608));
+     try std.testing.expect(vision.scratchBytes(picture_tokens) < 1 << 30);
+ }
+diff --git a/zig/src/families/inkling2/vision.zig b/zig/src/families/inkling2/vision.zig
+index eced25b16..f348cf358 100644
+--- a/zig/src/families/inkling2/vision.zig
++++ b/zig/src/families/inkling2/vision.zig
+@@ -12,7 +12,6 @@ pub const head_dim = 64;
+ pub const depth = 23;
+ pub const mlp_inter = 4096;
+ pub const proj_inter = 4096;
+-pub const hidden = 4608; // the decoder's width
+ const merged = image.merge * image.merge * width; // a token's four patch rows side by side
+ const eps: f32 = 1e-5;
+ const pre = "model.visual.backbone.";
+@@ -97,6 +96,7 @@ pub const Tower = struct {
+     pre_b: u64 = 0,
+     proj_in: u64 = 0, // [4096][4096], no bias
+     proj_out: u64 = 0, // [hidden][4096], no bias
++    hidden: usize = 0, // the decoder's width, proj_out's rows (Small 4608, Mini 2304)
+     layers: [depth]Layer = undefined,
+     px: u64 = 0, // bf16 [P][1200]
+     x: u64 = 0, // bf16 [R][width]: the residual stream (row 0 the class token)
+@@ -157,7 +157,9 @@ pub const Tower = struct {
+         t.pre_w = try t.get(&ck, pre ++ "ln_pre.weight", &.{width});
+         t.pre_b = try t.get(&ck, pre ++ "ln_pre.bias", &.{width});
+         t.proj_in = try t.get(&ck, "model.visual.proj_in.weight", &.{ proj_inter, merged });
+-        t.proj_out = try t.get(&ck, "model.visual.proj_out.weight", &.{ hidden, proj_inter });
++        t.hidden = (try ck.get("model.visual.proj_out.weight")).shape[0];
++        if (t.hidden == 0 or t.hidden % 128 != 0) return error.UnexpectedTensor;
++        t.proj_out = try t.get(&ck, "model.visual.proj_out.weight", &.{ t.hidden, proj_inter });
+         const w = try gpa.alloc(u8, 3 * width * width * 2);
+         defer gpa.free(w);
+         for (&t.layers, 0..) |*l, i| {
+@@ -253,7 +255,7 @@ pub const Tower = struct {
+         try t.upload(t.sn, std.mem.sliceAsBytes(sn));
+     }
+ 
+-    /// One picture to its tokens' rows at `out` (bf16 [tokens][hidden]): what replaces its placeholders' embeddings.
++    /// One picture to its tokens' rows at `out` (bf16 [tokens][t.hidden]): what replaces its placeholders' embeddings.
+     pub fn encode(t: *Tower, s: cuda.Stream, p: image.Prepared, out: u64) !void {
+         return t.encodeWith(s, p, out, true);
+     }
+@@ -275,7 +277,7 @@ pub const Tower = struct {
+         // the projector: each token's four patch rows (merge order, after the class row) as one 4096-wide row
+         try t.g.run(s, t.x + width * 2, t.proj_in, t.p1, T, proj_inter, merged, .bf16);
+         try t.vk.pointwise(s, t.p1, null, t.p1, T * proj_inter, .gelu);
+-        try t.g.run(s, t.p1, t.proj_out, out, T, hidden, proj_inter, .bf16);
++        try t.g.run(s, t.p1, t.proj_out, out, T, t.hidden, proj_inter, .bf16);
+     }
+ 
+     fn layer(t: *Tower, s: cuda.Stream, l: Layer, R: usize) !void {
+@@ -349,7 +351,7 @@ pub fn cut(sp: Span, lo: usize, hi: usize) ?Copy {
+ }
+ 
+ /// After the normed embedding, a pass's rows at positions [lo, hi) (bf16 at `x`) take their image rows (at `rows`).
+-pub fn splice(d: *const cuda.Driver, s: cuda.Stream, rows: u64, list: []const Span, lo: usize, hi: usize, x: u64) !void {
++pub fn splice(d: *const cuda.Driver, s: cuda.Stream, rows: u64, list: []const Span, lo: usize, hi: usize, x: u64, hidden: usize) !void {
+     for (list) |sp| {
+         const c = cut(sp, lo, hi) orelse continue;
+         const row: u64 = hidden * 2;
+diff --git a/zig/src/families/inkling2/vision_main.zig b/zig/src/families/inkling2/vision_main.zig
+index d76441534..ea8854178 100644
+--- a/zig/src/families/inkling2/vision_main.zig
++++ b/zig/src/families/inkling2/vision_main.zig
+@@ -10,7 +10,7 @@ const vision = ink.vision;
+ const usage = "usage: tf-inkling2-vision prep <out dir> <picture>...\n" ++
+     "       tf-inkling2-vision tower <model dir> <out dir> [--no-rope] [--layers N] [--ids DIR --chunk N] <picture>...\n" ++
+     "  prep writes <name>.pixels.f32 (the processor's pixel_values) and <name>.json (grid, tokens);\n" ++
+-    "  tower also writes <name>.feat.bf16 ([tokens][4608]), or <name>.x.bf16 (the residual rows) with --layers N < 23;\n" ++
++    "  tower also writes <name>.feat.bf16 ([tokens][hidden]), or <name>.x.bf16 (the residual rows) with --layers N < 23;\n" ++
+     "  --no-rope plants a control: the rotary tables set to the identity;\n" ++
+     "  --ids splices the rows into DIR/<name>.ids.u32's placeholders in passes of N rows: <name>.spliced.bf16\n";
+ 
+@@ -80,8 +80,8 @@ pub fn main(init: std.process.Init) !u8 {
+     t.layers_run = layers;
+     std.debug.print("tower: {d} MiB on the device (weights and scratch for {d} tokens)\n", .{ t.bytes >> 20, most });
+     for (pics.items, prepared.items) |path, p| {
+-        const per: usize = if (layers < vision.depth) vision.width else vision.hidden;
+-        const rows = if (layers < vision.depth) (image.patchCount(p) + 1) * vision.width else @as(usize, p.tokens()) * vision.hidden;
++        const per: usize = if (layers < vision.depth) vision.width else t.hidden;
++        const rows = if (layers < vision.depth) (image.patchCount(p) + 1) * vision.width else @as(usize, p.tokens()) * t.hidden;
+         var dst = try cuda.DeviceBuffer.alloc(&driver, rows * 2);
+         defer dst.free();
+         try t.encodeWith(stream, p, dst.ptr, rope);
+@@ -90,20 +90,20 @@ pub fn main(init: std.process.Init) !u8 {
+         if (layers < vision.depth) try cuda.memory.download(&driver, t.x, host) else try dst.download(0, host);
+         try write(io, out, stem(path), if (layers < vision.depth) "x.bf16" else "feat.bf16", host);
+         std.debug.print("{s}: {d} rows\n", .{ stem(path), rows / per });
+-        if (ids_dir) |dir| try spliced(io, a, &driver, stream, dir, out, stem(path), p, dst.ptr, @max(chunk, 1));
++        if (ids_dir) |dir| try spliced(io, a, &driver, stream, dir, out, stem(path), p, dst.ptr, @max(chunk, 1), t.hidden);
+     }
+     return 0;
+ }
+ 
+ /// The decoder hook on real ids: zeroed pass rows, each pass spliced as the forward will, gathered into one file.
+-fn spliced(io: std.Io, a: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, dir: []const u8, out: []const u8, name: []const u8, p: image.Prepared, feat: u64, chunk: usize) !void {
++fn spliced(io: std.Io, a: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, dir: []const u8, out: []const u8, name: []const u8, p: image.Prepared, feat: u64, chunk: usize, hidden: usize) !void {
+     var buf: [512]u8 = undefined;
+     const raw = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&buf, "{s}/{s}.ids.u32", .{ dir, name }), a, .limited(1 << 24));
+     const ids = try a.alloc(u32, raw.len / 4);
+     @memcpy(std.mem.sliceAsBytes(ids), raw[0 .. ids.len * 4]);
+     const list = try vision.spans(a, ids);
+     try vision.check(list, &.{p});
+-    const row = vision.hidden * 2;
++    const row = hidden * 2;
+     var pass = try cuda.DeviceBuffer.alloc(d, chunk * row);
+     defer pass.free();
+     const host = try a.alloc(u8, ids.len * row);
+@@ -113,7 +113,7 @@ fn spliced(io: std.Io, a: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stre
+     while (lo < ids.len) : (lo += chunk) {
+         const hi = @min(ids.len, lo + chunk);
+         try pass.upload(0, zeros);
+-        try vision.splice(d, s, feat, list, lo, hi, pass.ptr);
++        try vision.splice(d, s, feat, list, lo, hi, pass.ptr, hidden);
+         try s.synchronize();
+         try pass.download(0, host[lo * row .. hi * row]);
+     }
+-- 
+2.53.0
+

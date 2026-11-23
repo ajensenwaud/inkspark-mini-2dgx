@@ -1,0 +1,196 @@
+From 2377f2444b993de8e2e5f0de62d53b56d7f13673 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:46:16 +1100
+Subject: [PATCH 17/24] inkling2: the streams' draft walks step together: one
+ vocabulary launch and one pick gather a step
+
+---
+ zig/kernels/cuda/inkling2/dspark.cu      | 44 ++++++++++++++++++++++++
+ zig/src/families/inkling2/dspark_ops.zig | 28 +++++++++++++++
+ zig/src/families/inkling2/dspark_run.zig | 43 +++++++++++++----------
+ 3 files changed, 96 insertions(+), 19 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/dspark.cu b/zig/kernels/cuda/inkling2/dspark.cu
+index 67cfd2094..3426aae0c 100644
+--- a/zig/kernels/cuda/inkling2/dspark.cu
++++ b/zig/kernels/cuda/inkling2/dspark.cu
+@@ -310,6 +310,50 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2_dsp_vocab(const uint16
+     out[v] = v < valid ? bfr(tanhf(x / cap) * cap) : -INFINITY;
+ }
+ 
++// tf_ink2_dsp_vocab for `rows` streams at once (base rows base_ld apart): each fold row read once, sums as its order.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_dsp_vocab_rows(const uint16_t* __restrict__ base, long long base_ld,
++                                                                         const uint16_t* __restrict__ latent,
++                                                                         const uint16_t* __restrict__ fold,
++                                                                         const uint16_t* __restrict__ fbias, float cap, int valid,
++                                                                         int nv, int rows, float* __restrict__ out) {
++    using namespace ink2d;
++    const int v = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    if (v >= nv) return;
++    const uint16_t* f = fold + static_cast<size_t>(v) * 256;
++    float w[8];
++    for (int q = 0; q < 8; ++q) w[q] = bf(f[lane + 32 * q]);
++    const float fb = bf(fbias[v]);
++    for (int r = 0; r < rows; ++r) {
++        const uint16_t* lt = latent + static_cast<size_t>(r) * 256;
++        float s = 0.0f;
++        for (int q = 0; q < 8; ++q) s += bf(lt[lane + 32 * q]) * w[q];
++        s = warpSum(s);
++        if (lane == 0) {
++            const float b = bfr(s + fb);
++            const float x = bfr(bf(base[r * base_ld + v]) + b);
++            out[static_cast<size_t>(r) * nv + v] = v < valid ? bfr(tanhf(x / cap) * cap) : -INFINITY;
++        }
++    }
++}
++
++// tf_ink2_dsp_pick for `rows` streams: rank q's pick of row r at picks[(q * rows + r) * 4]; into walk[r * T + j + 1].
++extern "C" __global__ void tf_ink2_dsp_pick_rows(const float* __restrict__ picks, int world, int rows, int* __restrict__ walk,
++                                                 int T, int j) {
++    const int r = threadIdx.x;
++    if (r >= rows) return;
++    float bv = -INFINITY;
++    int bi = 0x7fffffff;
++    for (int q = 0; q < world; ++q) {
++        const float v = picks[(q * rows + r) * 4];
++        const int i = reinterpret_cast<const int*>(picks)[(q * rows + r) * 4 + 1];
++        if (v > bv || (v == bv && i < bi)) {
++            bv = v;
++            bi = i;
++        }
++    }
++    walk[r * T + j + 1] = bi;
++}
++
+ // The ranks' (value, id) picks, 16 bytes apart: the largest value, the lowest id among equals, into walk[j + 1].
+ extern "C" __global__ void tf_ink2_dsp_pick(const float* __restrict__ picks, int world, int* __restrict__ walk, int j) {
+     float bv = -INFINITY;
+diff --git a/zig/src/families/inkling2/dspark_ops.zig b/zig/src/families/inkling2/dspark_ops.zig
+index c9b9dfcaa..38620c03d 100644
+--- a/zig/src/families/inkling2/dspark_ops.zig
++++ b/zig/src/families/inkling2/dspark_ops.zig
+@@ -53,6 +53,8 @@ pub const Kernels = struct {
+     rnn: cuda.Function,
+     vocab: cuda.Function,
+     pick: cuda.Function,
++    vocab_rows: cuda.Function,
++    pick_rows: cuda.Function,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -70,6 +72,8 @@ pub const Kernels = struct {
+             .rnn = try mod.function("tf_ink2_dsp_rnn"),
+             .vocab = try mod.function("tf_ink2_dsp_vocab"),
+             .pick = try mod.function("tf_ink2_dsp_pick"),
++            .vocab_rows = try mod.function("tf_ink2_dsp_vocab_rows"),
++            .pick_rows = try mod.function("tf_ink2_dsp_pick_rows"),
+         };
+     }
+ 
+@@ -180,6 +184,30 @@ pub fn vocab(k: *const Kernels, s: cuda.Stream, base: u64, latent: u64, fold: u6
+     try go(k.vocab, s, .{ .x = @intCast((nv + 7) / 8) }, 256, &a);
+ }
+ 
++/// `rows` streams' step logits in one launch (base rows `base_ld` elements apart): each row's bits as `vocab`'s.
++pub fn vocabRows(k: *const Kernels, s: cuda.Stream, base: u64, base_ld: usize, latent: u64, fold: u64, fbias: u64, cap: f32, valid: usize, nv: usize, rows: usize, out: u64) !void {
++    var a: cuda.Args = .{};
++    a.add(base);
++    a.add(@as(i64, @intCast(base_ld)));
++    for ([_]u64{ latent, fold, fbias }) |v| a.add(v);
++    a.add(cap);
++    a.add(int(valid));
++    a.add(int(nv));
++    a.add(int(rows));
++    a.add(out);
++    try go(k.vocab_rows, s, .{ .x = @intCast((nv + 7) / 8) }, 256, &a);
++}
++
++/// Every stream's best pick across ranks (rank q's row r at (q * rows + r) * 16 bytes) into its walk.
++pub fn pickRows(k: *const Kernels, s: cuda.Stream, picks: u64, world: usize, rows: usize, walk: u64, t: usize, j: usize) !void {
++    var a: cuda.Args = .{};
++    a.add(picks);
++    for ([_]usize{ world, rows }) |v| a.add(int(v));
++    a.add(walk);
++    for ([_]usize{ t, j }) |v| a.add(int(v));
++    try go(k.pick_rows, s, .{ .x = 1 }, 32, &a);
++}
++
+ pub fn pick(k: *const Kernels, s: cuda.Stream, picks: u64, world: usize, walk: u64, j: usize) !void {
+     var a: cuda.Args = .{};
+     a.add(picks);
+diff --git a/zig/src/families/inkling2/dspark_run.zig b/zig/src/families/inkling2/dspark_run.zig
+index 9cf027049..13a61100b 100644
+--- a/zig/src/families/inkling2/dspark_run.zig
++++ b/zig/src/families/inkling2/dspark_run.zig
+@@ -96,10 +96,10 @@ pub const Drafter = struct {
+     po: u64 = 0,
+     pml: u64 = 0,
+     base: u64 = 0, // bf16 [streams * T][nv]
+-    mctx: u64 = 0, // fp32 [T - 1][3 rank]
++    mctx: u64 = 0, // fp32 [streams][T - 1][3 rank]
+     state: u64 = 0,
+     latent: u64 = 0,
+-    scores: u64 = 0, // fp32 [nv]
++    scores: u64 = 0, // fp32 [streams][nv]
+     picks: u64 = 0, // every rank's (value, id), padded to 16 bytes so the RoCE gather takes it
+     walk: u64 = 0, // int32 [streams][T]: each block's anchor, then each step's pick
+     ids: u64 = 0,
+@@ -127,7 +127,7 @@ pub const Drafter = struct {
+         for (w.layers[0..w.c.layers]) |l| part = @max(part, dr.lane.partBytes(ctx_rows, l.kv));
+         const R: usize = w.c.rank;
+         const qkvw = (dr.hq + 2 * dr.hk) * 128;
+-        const sizes = [_]usize{ part, dr.nv * R * 2, dr.nv * 2, TS * h * 2, TS * h * 2, TS * qkvw * 2, TS * dr.hq * 128 * 2, TS * dr.hq * 128 * 2, TS * 2 * dr.inter * 2, TS * dr.inter * 2, dr.world * TS * h * 4, dk.chunks(0, capacity) * T * dr.hq * 128 * 4, dk.chunks(0, capacity) * T * dr.hq * 8, TS * dr.nv * 2, T * 3 * R * 4, R * 2, R * 2, dr.nv * 4, dr.world * 16, TS * 4, TS * 4, ctx_rows * h * 2, ctx_rows * 2 * dr.hk * 128 * 2, (T - 1) * h * 2 };
++        const sizes = [_]usize{ part, dr.nv * R * 2, dr.nv * 2, TS * h * 2, TS * h * 2, TS * qkvw * 2, TS * dr.hq * 128 * 2, TS * dr.hq * 128 * 2, TS * 2 * dr.inter * 2, TS * dr.inter * 2, dr.world * TS * h * 4, dk.chunks(0, capacity) * T * dr.hq * 128 * 4, dk.chunks(0, capacity) * T * dr.hq * 8, TS * dr.nv * 2, TS * 3 * R * 4, max_streams * R * 2, max_streams * R * 2, max_streams * dr.nv * 4, dr.world * max_streams * 16, TS * 4, TS * 4, ctx_rows * h * 2, ctx_rows * 2 * dr.hk * 128 * 2, (T - 1) * h * 2 };
+         var ptrs: [sizes.len]u64 = undefined;
+         for (sizes, &ptrs) |n, *p| {
+             var b = try Buf.alloc(d, @max(n, 256));
+@@ -267,25 +267,30 @@ pub const Drafter = struct {
+         // rows 1..7 of each block: the head's base logits (one call: one block alone keeps its 7-row call), the walks
+         if (S == 1) try m.dense.decode(s, t.head, dr.x + h * 2, .bf16, T - 1, dr.base + dr.nv * 2, .bf16) else try m.dense.decode(s, t.head, dr.x, .bf16, rows, dr.base, .bf16);
+         const R: usize = c.rank;
++        var most: usize = 0;
+         for (bs, 0..) |b, j| {
+-            const hid = dr.x + (j * T + 1) * h * 2;
+-            const walk = dr.walk + j * T * 4;
+-            try dk.ctx(&dr.k, s, hid, b.slot.frnn, dr.w.rnn, dr.w.rnn_bias, dr.mctx, T - 1, h, R);
+-            try dr.d.check(dr.d.api.cuMemsetD8Async(dr.state, 0, R * 2, s.handle), "cuMemsetD8Async");
+-            for (0..b.out.len) |st| {
+-                try dk.rnn(&dr.k, s, dr.mctx + st * 3 * R * 4, dr.w.rnn, dr.w.w1, walk, st, dr.state, dr.latent, R, h);
+-                try dk.vocab(&dr.k, s, dr.base + (j * T + 1 + st) * dr.nv * 2, dr.latent, dr.fold, dr.fbias, dr.cap, dr.valid, dr.nv, dr.scores);
+-                if (dr.keep_logits != 0 and S == 1) try dr.copy(s, dr.keep_logits + st * dr.nv * 4, dr.scores, dr.nv * 4);
+-                const mine = dr.picks + dr.rank * 16;
++            try dk.ctx(&dr.k, s, dr.x + (j * T + 1) * h * 2, b.slot.frnn, dr.w.rnn, dr.w.rnn_bias, dr.mctx + j * (T - 1) * 3 * R * 4, T - 1, h, R);
++            most = @max(most, b.out.len);
++        }
++        try dr.d.check(dr.d.api.cuMemsetD8Async(dr.state, 0, S * R * 2, s.handle), "cuMemsetD8Async");
++        // walks step by step: all streams' logits in one launch, picks gathered once (extra steps' picks go unread)
++        for (0..most) |st| {
++            for (0..S) |j| try dk.rnn(&dr.k, s, dr.mctx + (j * (T - 1) + st) * 3 * R * 4, dr.w.rnn, dr.w.w1, dr.walk + j * T * 4, st, dr.state + j * R * 2, dr.latent + j * R * 2, R, h);
++            try dk.vocabRows(&dr.k, s, dr.base + (1 + st) * dr.nv * 2, T * dr.nv, dr.latent, dr.fold, dr.fbias, dr.cap, dr.valid, dr.nv, S, dr.scores);
++            if (dr.keep_logits != 0 and S == 1) try dr.copy(s, dr.keep_logits + st * dr.nv * 4, dr.scores, dr.nv * 4);
++            for (bs, 0..) |b, j| {
++                const mine = dr.picks + (dr.rank * S + j) * 16;
++                const sc = dr.scores + j * dr.nv * 4;
+                 if (b.race) |rc| {
+-                    try ops.race1(&m.ops, s, dr.scores, dr.valid, dr.vlo, rc.seed, rc.inv_t, b.p + 1 + st, mine, mine + 4);
+-                } else try ops.top1(&m.ops, s, dr.scores, 1, dr.nv, dr.nv, dr.vlo, mine, mine + 4);
+-                switch (ex) {
+-                    .local => {},
+-                    .nccl => |x| if (x.group) |g| try g.allGather(s, mine, dr.picks, 16) else try x.lib.check(x.lib.api.ncclAllGather(mine, dr.picks, 16, .u8, x.comm, s.handle), "ncclAllGather"),
+-                }
+-                try dk.pick(&dr.k, s, dr.picks, dr.world, walk, st);
++                    try ops.race1(&m.ops, s, sc, dr.valid, dr.vlo, rc.seed, rc.inv_t, b.p + 1 + st, mine, mine + 4);
++                } else try ops.top1(&m.ops, s, sc, 1, dr.nv, dr.nv, dr.vlo, mine, mine + 4);
++            }
++            const own = dr.picks + dr.rank * S * 16;
++            switch (ex) {
++                .local => {},
++                .nccl => |x| if (x.group) |g| try g.allGather(s, own, dr.picks, S * 16) else try x.lib.check(x.lib.api.ncclAllGather(own, dr.picks, S * 16, .u8, x.comm, s.handle), "ncclAllGather"),
+             }
++            try dk.pickRows(&dr.k, s, dr.picks, dr.world, S, dr.walk, T, st);
+         }
+         try s.synchronize();
+         switch (ex) {
+-- 
+2.53.0
+

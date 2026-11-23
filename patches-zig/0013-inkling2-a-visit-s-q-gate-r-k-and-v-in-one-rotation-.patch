@@ -1,0 +1,302 @@
+From 9219e8f2edf00d77efd2f4621bc0e6602afff1dc Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:18:13 +1100
+Subject: [PATCH 13/24] inkling2: a visit's q, gate, r, k and v in one rotation
+ launch and one linear launch
+
+---
+ zig/kernels/cuda/exl3_linear.cu          |  36 ++++++
+ zig/src/families/inkling2/engine.zig     |   1 +
+ zig/src/families/inkling2/forward.zig    |  26 +++--
+ zig/src/families/inkling2/inkling2.zig   |   1 +
+ zig/src/families/inkling2/proj_group.zig | 134 +++++++++++++++++++++++
+ 5 files changed, 190 insertions(+), 8 deletions(-)
+ create mode 100644 zig/src/families/inkling2/proj_group.zig
+
+diff --git a/zig/kernels/cuda/exl3_linear.cu b/zig/kernels/cuda/exl3_linear.cu
+index 956d409a6..4ee447efe 100644
+--- a/zig/kernels/cuda/exl3_linear.cu
++++ b/zig/kernels/cuda/exl3_linear.cu
+@@ -472,6 +472,42 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_group_8_2_8(tf_exl3::G
+     const int b = blockIdx.x, i = group_member(g, b);
+     tf_exl3::linear_body<8, 2, 8>(g.l[i], b - (i ? g.ends[i - 1] : 0));
+ }
++// A visit's projections (Inkling 2: q, gate, r, k, v): up to five layers of one K, each its own input rows and scales.
++struct RotGroup5Args {
++    const void* x[5];
++    const half* suh[5];
++    half* xh[5];
++    int x_dtype;
++    int m, k;
++};
++template <typename T>
++__device__ __forceinline__ T pick5(const T (&p)[5], int i) {
++    return i == 0 ? p[0] : i == 1 ? p[1] : i == 2 ? p[2] : i == 3 ? p[3] : p[4];
++}
++extern "C" __global__ void __launch_bounds__(128) tf_exl3_rot_group5(RotGroup5Args a) {
++    const int z = blockIdx.z;
++    rot_in_body(pick5(a.x, z), a.x_dtype, pick5(a.suh, z), pick5(a.xh, z), a.k);
++}
++struct GroupArgs5 {
++    LinearArgs l[5];
++    int ends[5];
++};
++// Member i of a five-way group: linear_body on its own blocks, exactly as its own launch would.
++template <int K2, int WK>
++__device__ __forceinline__ void group5_body(const GroupArgs5& g) {
++    const int b = blockIdx.x;
++    const int i = b < g.ends[0] ? 0 : b < g.ends[1] ? 1 : b < g.ends[2] ? 2 : b < g.ends[3] ? 3 : 4;
++    linear_body<K2, 2, WK>(g.l[i], b - (i ? g.ends[i - 1] : 0));
++}
++#define TF_EXL3_GROUP5(NAME, K2, WK) \
++    extern "C" __global__ void __launch_bounds__((WK) * 32) NAME(tf_exl3::GroupArgs5 g) { group5_body<K2, WK>(g); }
++TF_EXL3_GROUP5(tf_exl3_group5_8_2_4, 8, 4)
++TF_EXL3_GROUP5(tf_exl3_group5_8_2_8, 8, 8)
++TF_EXL3_GROUP5(tf_exl3_group5_10_2_4, 10, 4)
++TF_EXL3_GROUP5(tf_exl3_group5_10_2_8, 10, 8)
++TF_EXL3_GROUP5(tf_exl3_group5_12_2_4, 12, 4)
++TF_EXL3_GROUP5(tf_exl3_group5_12_2_8, 12, 8)
++#undef TF_EXL3_GROUP5
+ #undef TF_EXL3_CODEBOOK
+ #undef TF_EXL3_WIDTHS
+ }  // namespace tf_exl3
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 8cf0e8763..0c1552286 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -116,6 +116,7 @@ pub const Engine = struct {
+             break :blk null;
+         };
+         for (e.w.layers) |l| for ([_]cuda.exl3.Weight{ l.attn.k, l.attn.v, l.attn.r }) |x| try e.m.side.dense.reserve(stream, x);
++        for (e.w.layers) |l| try e.m.group.reserve(stream, &.{ l.attn.q, l.attn.gate, l.attn.r, l.attn.k, l.attn.v });
+         if (o.drafts and ds.present(io, gpa, dir)) {
+             try e.loadDrafter(dir, o.capacity);
+         }
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index daa552935..485be3d0e 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -11,6 +11,7 @@ const prompt_dense = @import("prompt_dense.zig");
+ const state = @import("state.zig");
+ const loop = @import("loop.zig");
+ const visits = @import("visits.zig");
++const proj_group = @import("proj_group.zig");
+ 
+ const Buf = cuda.DeviceBuffer;
+ 
+@@ -22,6 +23,7 @@ pub const Modules = struct {
+     ops: ops.Kernels,
+     side: Side,
+     loop: loop.Kernels,
++    group: proj_group.Group, // decode rows' q, gate, r, k, v in one launch
+     prompt: ?prompt_dense.Prompt = null, // prompt rows' dense projections (Engine.init sets it once the weights load)
+ 
+     pub fn load(d: *const cuda.Driver) !Modules {
+@@ -35,11 +37,13 @@ pub const Modules = struct {
+         errdefer o.unload();
+         var lk = try loop.Kernels.load(d);
+         errdefer lk.unload();
+-        return .{ .dense = dense, .experts = ex, .attn = attn, .ops = o, .loop = lk, .side = try Side.init(d) };
++        const g = try proj_group.Group.init(d, &dense.lin);
++        return .{ .dense = dense, .experts = ex, .attn = attn, .ops = o, .loop = lk, .group = g, .side = try Side.init(d) };
+     }
+ 
+     pub fn deinit(m: *Modules) void {
+         if (m.prompt) |*p| p.deinit();
++        m.group.deinit();
+         m.side.deinit();
+         m.loop.unload();
+         m.ops.unload();
+@@ -445,26 +449,32 @@ pub const Forward = struct {
+             const xv = if (apart) b.normed + 2 * n * h * 2 else xq;
+             const a = &l.attn;
+             const sd = &f.m.side;
++            const group = [_]proj_group.Member{ .{ .w = a.q, .x = xq, .y = b.q, .dt = .bf16 }, .{ .w = a.gate, .x = xq, .y = b.gate, .dt = .bf16 }, .{ .w = a.r, .x = xq, .y = if (a.r_lo != null) b.rw else b.r, .dt = .bf16 }, .{ .w = a.k, .x = xk, .y = b.kf, .dt = .f32 }, .{ .w = a.v, .x = xv, .y = b.vf, .dt = .f32 } };
++            const grouped = proj_group.Group.fits(&group, n); // decode rows: five projections, two launches, the same bits
+             // prompt rows run the narrow projections on the main stream: one GEMM scratch, and they fill the GPU alone
+             const ss = if (f.m.prompt != null and n >= prompt_dense.min_rows) s else sd.stream;
+             try sd.fork.record(s);
+             try ss.wait(sd.fork);
++            if (grouped) try f.m.group.run(s, &group, n) else if (a.r_lo == null) try f.proj(ss, &sd.dense, a.r, xq, n, b.r, .bf16) else try f.proj(ss, &sd.dense, a.r, xq, n, b.rw, .bf16);
+             if (a.r_lo) |lo| { // every head's r, then this rank's columns
+-                try f.proj(ss, &sd.dense, a.r, xq, n, b.rw, .bf16);
+                 const all: usize = c.heads * c.d_rel * 2;
+                 const m: cuda.abi.Memcpy2D = .{ .src = b.rw + lo * 2, .src_pitch = all, .dst = b.r, .dst_pitch = f.shape.heads * c.d_rel * 2, .width = f.shape.heads * c.d_rel * 2, .height = n };
+-                try f.d.check(f.d.api.cuMemcpy2DAsync_v2(&m, ss.handle), "cuMemcpy2DAsync");
+-            } else try f.proj(ss, &sd.dense, a.r, xq, n, b.r, .bf16);
+-            try f.proj(ss, &sd.dense, a.k, xk, n, b.kf, .f32);
+-            try f.proj(ss, &sd.dense, a.v, xv, n, b.vf, .f32);
++                try f.d.check(f.d.api.cuMemcpy2DAsync_v2(&m, (if (grouped) s else ss).handle), "cuMemcpy2DAsync");
++            }
++            if (!grouped) {
++                try f.proj(ss, &sd.dense, a.k, xk, n, b.kf, .f32);
++                try f.proj(ss, &sd.dense, a.v, xv, n, b.vf, .f32);
++            }
+             try ops.rowdot(k, ss, xq, a.sink, b.sink, n, f.shape.heads, h, true, false);
+             if (global) {
+                 try ops.rowdot(k, ss, xk, a.k_proj, b.dk, n, f.shape.kv * c.conv, h, false, false);
+                 try ops.rowdot(k, ss, xv, a.v_proj, b.dv, n, f.shape.kv * c.conv, h, false, false);
+             }
+             try sd.join.record(ss);
+-            try f.dense(a.q, xq, n, b.q, .bf16);
+-            try f.dense(a.gate, xq, n, b.gate, .bf16);
++            if (!grouped) {
++                try f.dense(a.q, xq, n, b.q, .bf16);
++                try f.dense(a.gate, xq, n, b.gate, .bf16);
++            }
+             try s.wait(sd.join);
+             const cv = st.conv[sl];
+             try ops.conv(k, s, .{ .x = b.kf, .state = cv[0], .w = a.k_conv, .dyn = if (global) b.dk else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.kraw, .segs = conv_segs, .hist = f.hist(sl, 0), .state_stride = @intCast(3 * kvw) }, streams);
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index e07c42d63..d3ce2fe80 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -58,4 +58,5 @@ test {
+     _ = dspark_run;
+     _ = @import("profile.zig");
+     _ = @import("dspark_quant.zig");
++    _ = @import("proj_group.zig");
+ }
+diff --git a/zig/src/families/inkling2/proj_group.zig b/zig/src/families/inkling2/proj_group.zig
+new file mode 100644
+index 000000000..f8958733f
+--- /dev/null
++++ b/zig/src/families/inkling2/proj_group.zig
+@@ -0,0 +1,134 @@
++//! A visit's narrow projections (q, gate, r, k, v) as one rotation launch and one linear launch, each member's bits.
++const std = @import("std");
++const cuda = @import("cuda");
++
++const exl3 = cuda.exl3;
++const Buf = cuda.DeviceBuffer;
++
++/// The most members and rows a group launch takes (linear_body's one-pass rows).
++pub const max_members = 5;
++pub const max_rows = 16;
++const widths = [_]u32{ 8, 10, 12 }; // halves: 4, 5 and 6 bits, mul1
++
++/// exl3_linear.cu's LinearArgs, GroupArgs5 and RotGroup5Args as the kernels read them.
++const LinearArgsC = extern struct { xh: u64, t: u64, stride_k: i64, stride_nb: i64, svh: u64, bias: u64, y: u64, z: u64, counters: u64, y_dtype: i32, n: i32, sk: i32, m: i32, k: i32 };
++const GroupC = extern struct { l: [max_members]LinearArgsC, ends: [max_members]i32 };
++const RotC = extern struct { x: [max_members]u64, suh: [max_members]u64, xh: [max_members]u64, x_dtype: i32, m: i32, k: i32 };
++
++/// One member: its weight, input rows (bf16) and output (y_dtype).
++pub const Member = struct { w: exl3.Weight, x: u64, y: u64, dt: exl3.DType };
++
++pub const Group = struct {
++    d: *const cuda.Driver,
++    rot: cuda.Function,
++    fns: [widths.len][2]cuda.Function, // by width, then 4 or 8 warps
++    pdl: bool,
++    xh: ?Buf = null,
++    z: ?Buf = null,
++    counters: ?Buf = null,
++
++    pub fn init(d: *const cuda.Driver, lin: *const exl3.Linear) !Group {
++        var g: Group = .{ .d = d, .rot = try lin.mod.function("tf_exl3_rot_group5"), .fns = undefined, .pdl = lin.pdl };
++        inline for (widths, 0..) |hv, i| inline for (.{ 4, 8 }, 0..) |wk, j| {
++            g.fns[i][j] = try lin.mod.function(std.fmt.comptimePrint("tf_exl3_group5_{d}_2_{d}", .{ hv, wk }));
++        };
++        return g;
++    }
++
++    pub fn deinit(g: *Group) void {
++        for ([_]*?Buf{ &g.xh, &g.z, &g.counters }) |b| if (b.*) |*x| {
++            x.free();
++            b.* = null;
++        };
++    }
++
++    /// Whether one launch takes these members at `rows`: one K, width and warp count, whole 128-column blocks.
++    pub fn fits(ms: []const Member, rows: usize) bool {
++        if (ms.len < 2 or ms.len > max_members or rows < 1 or rows > max_rows) return false;
++        const w0 = ms[0].w;
++        const wk = exl3.planOf(w0).wk;
++        if ((wk != 4 and wk != 8) or std.mem.indexOfScalar(u32, &widths, w0.halves) == null) return false;
++        for (ms) |m| {
++            const w = m.w;
++            const p = exl3.planOf(w);
++            if (w.halves != w0.halves or w.codebook != .mul1 or w.k != w0.k or p.wk != wk or m.dt == .f16) return false;
++            if (w.k % 128 != 0 or w.n % 128 != 0 or (w.k / 16) % (p.sk * p.wk) != 0) return false;
++        }
++        return true;
++    }
++
++    fn grown(g: *Group, slot: *?Buf, bytes: usize, zero: ?cuda.Stream) !u64 {
++        if (slot.*) |b| if (b.len >= bytes) return b.ptr;
++        const nb = try Buf.alloc(g.d, bytes);
++        if (slot.*) |*old| old.free();
++        slot.* = nb;
++        if (zero) |s| try slot.*.?.fill8(0, s.handle); // counters start at zero; each block's last program resets its own
++        return nb.ptr;
++    }
++
++    /// Scratch for a group of `ws` at max_rows, grown before any graph capture (a call inside one allocates nothing).
++    pub fn reserve(g: *Group, s: cuda.Stream, ws: []const exl3.Weight) !void {
++        var zb: usize = 0;
++        var cb: usize = 0;
++        for (ws) |w| {
++            zb += exl3.Linear.zBytes(w, max_rows);
++            cb += exl3.Linear.counterBytes(w);
++        }
++        _ = try g.grown(&g.xh, ws.len * max_rows * ws[0].k * 2, null);
++        if (zb > 0) _ = try g.grown(&g.z, zb, null);
++        _ = try g.grown(&g.counters, cb, s);
++    }
++
++    /// Every member's y from its x on `s`: the rotations in one launch, then the linears in one.
++    pub fn run(g: *Group, s: cuda.Stream, ms: []const Member, rows: usize) !void {
++        if (!fits(ms, rows)) return error.Exl3Group;
++        var ws: [max_members]exl3.Weight = undefined;
++        for (ms, 0..) |m, i| ws[i] = m.w;
++        try g.reserve(s, ws[0..ms.len]);
++        const k = ms[0].w.k;
++        var rot: RotC = .{ .x = @splat(0), .suh = @splat(0), .xh = @splat(0), .x_dtype = @backingInt(exl3.DType.bf16), .m = @intCast(rows), .k = @intCast(k) };
++        var ga: GroupC = .{ .l = undefined, .ends = @splat(0) };
++        var zat = if (g.z) |b| b.ptr else 0;
++        var cat = g.counters.?.ptr;
++        var end: i32 = 0;
++        for (ms, 0..) |m, i| {
++            const w = m.w;
++            const p = exl3.planOf(w);
++            rot.x[i] = m.x;
++            rot.suh[i] = w.suh;
++            rot.xh[i] = g.xh.?.ptr + i * max_rows * k * 2;
++            ga.l[i] = .{ .xh = rot.xh[i], .t = w.trellis, .stride_k = @intCast(w.stride_k), .stride_nb = @intCast(w.stride_nb), .svh = w.svh, .bias = w.bias, .y = m.y, .z = if (p.sk > 1) zat else 0, .counters = cat, .y_dtype = @backingInt(m.dt), .n = @intCast(w.n), .sk = @intCast(p.sk), .m = @intCast(rows), .k = @intCast(k) };
++            zat += exl3.Linear.zBytes(w, max_rows);
++            cat += exl3.Linear.counterBytes(w);
++            end += @intCast(w.n / 128 * p.sk);
++            ga.ends[i] = end;
++        }
++        for (ms.len..max_members) |i| {
++            ga.l[i] = ga.l[0];
++            ga.ends[i] = end;
++        }
++        var ra: cuda.Args = .{};
++        ra.add(rot);
++        try cuda.launch.launch(g.rot, .{ .grid = .{ .x = @intCast((k / 128 + 3) / 4), .y = @intCast(rows), .z = @intCast(ms.len) }, .block = .{ .x = 128 }, .pdl = g.pdl }, s, &ra);
++        var la: cuda.Args = .{};
++        la.add(ga);
++        const wk = exl3.planOf(ms[0].w).wk;
++        const wi = std.mem.indexOfScalar(u32, &widths, ms[0].w.halves).?;
++        try cuda.launch.launch(g.fns[wi][if (wk == 4) 0 else 1], .{ .grid = .{ .x = @intCast(end) }, .block = .{ .x = wk * 32 }, .shared = exl3.Linear.sharedBytes(ms[0].w, rows), .pdl = g.pdl }, s, &la);
++    }
++};
++
++test "proj_group: members of one width, K and warps fit; others do not" {
++    const w: exl3.Weight = .{ .trellis = 0, .suh = 0, .svh = 0, .k = 2304, .n = 1536, .halves = 12, .codebook = .mul1, .stride_k = 0, .stride_nb = 0 };
++    var r = w;
++    r.n = 384;
++    const ms = [_]Member{ .{ .w = w, .x = 0, .y = 0, .dt = .bf16 }, .{ .w = r, .x = 0, .y = 0, .dt = .f32 } };
++    try std.testing.expect(Group.fits(&ms, 1));
++    try std.testing.expect(Group.fits(&ms, 16));
++    try std.testing.expect(!Group.fits(&ms, 17));
++    var odd = ms;
++    odd[1].w.halves = 8;
++    try std.testing.expect(!Group.fits(&odd, 1));
++    try std.testing.expectEqual(@as(usize, 136), @sizeOf(RotC));
++    try std.testing.expectEqual(@as(usize, 504), @sizeOf(GroupC));
++}
+-- 
+2.53.0
+
