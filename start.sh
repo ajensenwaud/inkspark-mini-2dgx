@@ -11,6 +11,8 @@ need_pair
 
 rank_cmd() {   # RANK: the docker command that starts one rank
   local serve="serve /model --name $SERVED_NAME --host $HOST --port $PORT --context $CONTEXT --parallel $PARALLEL ${SERVE_EXTRA:-}"
+  local NCCL_IFNAME=$NCCL_IFNAME NCCL_HCA=$NCCL_HCA
+  [[ $1 == 1 ]] && NCCL_IFNAME=$WORKER_IFNAME NCCL_HCA=$WORKER_HCA
   [[ "$VISION" == 1 ]] && serve+=" --vision"
   [[ "$DRAFTER" == 1 ]] || serve+=" --no-drafts"
   echo "docker run -d --name $CONTAINER-r$1 --gpus all --network host --ipc host" \

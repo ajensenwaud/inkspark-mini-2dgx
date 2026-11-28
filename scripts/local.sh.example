@@ -1,3 +1,5 @@
 # Copy to scripts/local.sh (gitignored) and fill in your two Sparks.
 WORKER=user@192.0.2.2      # rank 1: user@address on the CX7 link between the Sparks
 MASTER=192.0.2.1           # rank 0 (this head): its address on that link
+# WORKER_IFNAME=enp1s0f1np1  # only if the worker's end of the link is a different port from the head's
+# WORKER_HCA=rocep1s0f1      # (default: NCCL_IFNAME and NCCL_HCA, the head's)

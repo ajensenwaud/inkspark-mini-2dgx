@@ -54,6 +54,9 @@ NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f0np0}"
 NCCL_HCA="${NCCL_HCA:-rocep1s0f0}"
 
 [[ -f "$(dirname "${BASH_SOURCE[0]}")/local.sh" ]] && source "$(dirname "${BASH_SOURCE[0]}")/local.sh"
+# the worker's end of the link, when its port differs from the head's
+WORKER_IFNAME="${WORKER_IFNAME:-$NCCL_IFNAME}"
+WORKER_HCA="${WORKER_HCA:-$NCCL_HCA}"
 
 log() { printf '[%s] %s\n' "$(basename "$0")" "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
